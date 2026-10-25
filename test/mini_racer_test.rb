@@ -775,6 +775,75 @@ class MiniRacerTest < Minitest::Test
     context&.dispose
   end
 
+  def test_date_iso_option_passes_calendar_days_as_strings
+    context = MiniRacer::Context.new(date: :iso)
+    context.eval(<<~JS)
+      function echo(value) { return value; }
+      function kind(value) { return value instanceof Date ? "Date" : typeof value; }
+    JS
+    date = Date.new(2026, 10, 25)
+    datetime = DateTime.new(2026, 10, 25, 12, 34, 56, "+05:30")
+    time = Time.at(1_792_900_000)
+
+    assert_equal "2026-10-25", context.call("echo", date)
+    assert_equal(
+      { "rows" => [{ "day" => "2026-10-25" }] },
+      context.call("echo", { rows: [{ day: date }] })
+    )
+    context.attach("rubyRows", -> { [{ day: date, at: datetime, now: time }] })
+    assert_equal %w[string Date Date],
+                 context.eval(
+                   "const r = rubyRows()[0]; [kind(r.day), kind(r.at), kind(r.now)]"
+                 )
+    assert_equal datetime.to_time.to_i, context.eval("rubyRows()[0].at").to_i
+    # subclasses keep their previous conversion, as without the option
+    assert_equal "Undefined Conversion",
+                 context.call("echo", Class.new(Date).new(2026, 10, 25))
+  ensure
+    context&.dispose
+  end
+
+  def test_date_option_defaults_to_js_dates
+    [
+      MiniRacer::Context.new,
+      MiniRacer::Context.new(date: :time)
+    ].each do |context|
+      context.eval("function isDate(value) { return value instanceof Date; }")
+      assert context.call("isDate", Date.new(2026, 10, 25))
+    ensure
+      context.dispose
+    end
+  end
+
+  def test_decimal_float_option_passes_big_decimals_as_numbers
+    require "bigdecimal"
+    context = MiniRacer::Context.new(decimal: :float)
+    context.eval("function echo(value) { return value; }")
+
+    assert_equal 12.34, context.call("echo", BigDecimal("12.34"))
+    assert_equal(
+      { "total" => [-0.5] },
+      context.call("echo", { total: [BigDecimal("-0.5")] })
+    )
+    context.attach("rubyNumeric", -> { { amount: BigDecimal("1234567.891") } })
+    assert_equal true, context.eval("typeof rubyNumeric().amount === 'number'")
+    assert_equal 1_234_567.891, context.eval("rubyNumeric().amount")
+    assert_equal "Undefined Conversion", context.call("echo", Random.new)
+
+    default = MiniRacer::Context.new
+    default.eval("function echo(value) { return value; }")
+    assert_equal "Undefined Conversion",
+                 default.call("echo", BigDecimal("12.34"))
+  ensure
+    context&.dispose
+    default&.dispose
+  end
+
+  def test_bad_date_and_decimal_options_are_rejected
+    assert_raises(ArgumentError) { MiniRacer::Context.new(date: :string) }
+    assert_raises(ArgumentError) { MiniRacer::Context.new(decimal: :string) }
+  end
+
   def test_datetime_missing
     # NoMethodError: undefined method `source_location' for
     # #<Thread::Backtrace::Location:0x4e88>

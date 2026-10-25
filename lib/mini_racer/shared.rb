@@ -104,7 +104,9 @@ module MiniRacer
       isolate: nil,
       ensure_gc_after_idle: nil,
       snapshot: nil,
-      marshal_stack_depth: nil
+      marshal_stack_depth: nil,
+      date: nil,
+      decimal: nil
     )
       check_init_options!(
         isolate: isolate,
@@ -112,7 +114,9 @@ module MiniRacer
         max_memory: max_memory,
         marshal_stack_depth: marshal_stack_depth,
         ensure_gc_after_idle: ensure_gc_after_idle,
-        timeout: timeout
+        timeout: timeout,
+        date: date,
+        decimal: decimal
       )
 
       @functions = {}
@@ -122,6 +126,8 @@ module MiniRacer
       @timeout = timeout
       @max_memory = max_memory
       @marshal_stack_depth = marshal_stack_depth
+      @date_iso = date == :iso
+      @decimal_float = decimal == :float
 
       # false signals it should be fetched if requested
       @isolate = isolate || false
@@ -331,7 +337,9 @@ module MiniRacer
       max_memory:,
       marshal_stack_depth:,
       ensure_gc_after_idle:,
-      timeout:
+      timeout:,
+      date:,
+      decimal:
     )
       assert_option_is_nil_or_a("isolate", isolate, Isolate)
       assert_option_is_nil_or_a("snapshot", snapshot, Snapshot)
@@ -354,6 +362,13 @@ module MiniRacer
         min_value: 1
       )
       assert_numeric_or_nil("timeout", timeout, min_value: 1)
+
+      unless [nil, :time, :iso].include?(date)
+        raise ArgumentError, "bad date: expected :time or :iso"
+      end
+      unless [nil, :float].include?(decimal)
+        raise ArgumentError, "bad decimal: expected :float or nil"
+      end
 
       if isolate && snapshot
         raise ArgumentError, "can only pass one of isolate and snapshot options"

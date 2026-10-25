@@ -376,15 +376,21 @@ module MiniRacer
       when DateTime
         js_new_date(value.to_time.to_f * 1000)
       when Date
-        if value.instance_of?(Date)
-          js_new_date(value.to_time.to_f * 1000)
-        else
+        if !value.instance_of?(Date)
           "Undefined Conversion"
+        elsif @date_iso
+          Truffle::Interop.as_truffle_string value.iso8601
+        else
+          js_new_date(value.to_time.to_f * 1000)
         end
       when MiniRacer::Binary
         @js_new_uint8array_func.call(value.data.bytes)
       else
-        "Undefined Conversion"
+        if @decimal_float && defined?(BigDecimal) && value.is_a?(BigDecimal)
+          value.to_f
+        else
+          "Undefined Conversion"
+        end
       end
     end
 

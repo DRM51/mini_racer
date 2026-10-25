@@ -70,6 +70,24 @@ therefore represents midnight in Ruby's local timezone. `DateTime` keeps its
 existing conversion, preserving its time of day and the instant defined by its
 offset. JavaScript dates are returned to Ruby as `Time` values.
 
+Two context options change how values passed to JavaScript (attached function
+results and `Context#call` arguments, nested values included) are converted:
+
+```ruby
+context = MiniRacer::Context.new(date: :iso, decimal: :float)
+context.eval("function echo(v) { return v }")
+context.call("echo", Date.new(2026, 10, 25))   # => "2026-10-25"
+context.call("echo", BigDecimal("12.34"))      # => 12.34
+```
+
+- `date: :iso` passes a date-only `Date` as an ISO 8601 string (`Date#iso8601`)
+  instead of local midnight, so the calendar day does not depend on the
+  server's timezone. `DateTime` and `Time` are still JavaScript `Date`s. The
+  default is `date: :time`.
+- `decimal: :float` passes a `BigDecimal` as a JavaScript number (`to_f`),
+  which can lose precision. By default a `BigDecimal` becomes the string
+  `"Undefined Conversion"`, like other unsupported objects.
+
 Ruby `Integer` and JavaScript `BigInt` values are converted exactly up to a
 16 MiB magnitude (about 134 million bits). Larger individual values are
 rejected with a serialization error rather than truncated.
