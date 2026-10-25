@@ -2357,6 +2357,19 @@ class MiniRacerTest < Minitest::Test
     assert_in_delta time.to_f, context.call("f").to_f, 0.001
   end
 
+  # V8 implements Temporal with Rust code that libv8-node has to link in.
+  # Without it, Temporal is defined but crashes the process when used.
+  def test_temporal
+    context = MiniRacer::Context.new
+    skip "no Temporal in this V8" unless context.eval("typeof Temporal") == "object"
+    assert context.eval("Temporal.Now.instant().epochMilliseconds > 0")
+    assert_equal "2026-11-01", context.eval("Temporal.PlainDate.from('2026-10-25').add({ days: 7 }).toString()")
+    assert_equal "2026-10-26T04:00:00+09:00[Asia/Tokyo]",
+                 context.eval("Temporal.ZonedDateTime.from('2026-10-25T12:00[America/Los_Angeles]').withTimeZone('Asia/Tokyo').toString()")
+    assert_equal "2 hours, 5 minutes",
+                 context.eval("new Intl.DurationFormat('en', { style: 'long' }).format({ hours: 2, minutes: 5 })")
+  end
+
   def test_string_encoding
     context = MiniRacer::Context.new
     assert_equal "ä", context.eval("'ä'")
