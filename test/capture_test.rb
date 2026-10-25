@@ -212,6 +212,102 @@ class MiniRacerCaptureTest < Minitest::Test
     assert_equal 2, ctx.eval("1 + 1")
   end
 
+  def test_large_and_shared_values_are_recorded_once_and_cheaply
+    ctx = new_context(timeout: 5000)
+    ctx.eval(<<~JS)
+      const TABLE = {};
+      for (let i = 0; i < 200000; i++) TABLE["k" + i] = i;
+      const BIG = new Map(Array.from({ length: 20000 }, (_, i) => [i, i]));
+      function recurse(n) {
+        const refs = [TABLE, TABLE, TABLE, BIG];
+        const text = new String("x".repeat(1000000));
+        if (n === 0) throw new Error("bottom");
+        return recurse(n - 1);
+      }
+    JS
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    capture = capture_of { ctx.call("recurse", 9) }
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+    assert_operator elapsed, :<, 2, "recording took #{elapsed}s"
+    vars = variables(capture["frames"].first)
+    assert_equal "[Map(20000)]", vars["refs"][3]
+    assert vars["text"].end_with?("(1000000 chars)")
+    # the table appears once per reference but is the same record
+    assert_same vars["refs"][0], vars["refs"][1]
+    assert_equal ["script"],
+                 capture["frames"]
+                   .flat_map { |f| f["scopes"] }
+                   .map { |s| s["type"] }
+                   .grep("script")
+  end
+
+  def test_running_out_of_room_is_marked
+    ctx = new_context
+    capture = capture_of { ctx.eval(<<~JS) }
+          (function f() {
+            const grid = Array.from({ length: 50 }, () =>
+              Array.from({ length: 50 }, () => Array.from({ length: 50 }, (_, i) => i)));
+            throw new Error("big");
+          })()
+        JS
+    assert_equal true, capture["truncated"]
+    assert_includes capture.to_s, "[…]"
+  end
+
+  def test_each_error_gets_the_record_of_its_own_exception
+    ctx = new_context
+    # the other rejection pauses after the awaited one: it must not replace it
+    capture = capture_of { ctx.eval_await(<<~JS) }
+          const p = (async function real() { let a = 1; await null; throw new Error("real") })();
+          (async function other() { let b = 2; await null; await null; throw new Error("other") })();
+          p
+        JS
+    assert_equal "real", capture["frames"].first["function"]
+
+    # a rejection while a result is being converted belongs to no error
+    capture = capture_of { ctx.eval(<<~JS) }
+          ({ get x() {
+            (function unrelated() { let s = 1; Promise.reject(NaN) })();
+            throw "the real error";
+          } })
+        JS
+    assert_nil capture
+  end
+
+  def test_unusual_values
+    ctx = new_context
+    capture = capture_of { ctx.eval(<<~JS) }
+          (function f() {
+            const parsed = JSON.parse('{"__proto__": {"admin": true}, "y": 2}');
+            const bound = function g() {}.bind(null);
+            const re = /a+b/gi;
+            const big = 2n ** 2000n;
+            const small = 12n;
+            throw new Error("x");
+          })()
+        JS
+    vars = variables(capture["frames"].first)
+    assert_equal(
+      { "__proto__" => { "admin" => true }, "y" => 2 },
+      vars["parsed"]
+    )
+    assert_equal "[Function: bound g]", vars["bound"]
+    assert_equal "/a+b/gi", vars["re"]
+    assert_equal "[BigInt: 2048 bits]", vars["big"]
+    assert_equal 12, vars["small"]
+  end
+
+  def test_debugger_statements_do_not_pause
+    ctx = new_context
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    ctx.eval("for (let i = 0; i < 20000; i++) { debugger; }")
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started,
+                    :<,
+                    0.3
+    capture = capture_of { ctx.eval("(function f() { debugger; null.x })()") }
+    assert_equal "f", capture["frames"].first["function"]
+  end
+
   def test_cannot_be_combined_with_the_inspector
     assert_raises(ArgumentError) do
       MiniRacer::Context.new(capture_on_throw: true, inspector: "x")
