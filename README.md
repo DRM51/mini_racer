@@ -280,14 +280,31 @@ end
   V8 calls `toString` on a thrown object that isn't an `Error`. V8's debugger
   reads the exception's `name`, `message` and `stack`, so getters defined for
   those run once more than without the option.
-- Code that doesn't throw runs at the same speed. Costs:
-  - each captured failure: about 0.2 ms;
+- An exception counts as uncaught relative to the innermost `eval` or `call`:
+  one thrown inside a `try` in an outer script, around the Ruby callback that
+  made the nested `eval`, isn't recorded. The `script` scope (top-level
+  `let`/`const`) is listed once, in the first frame that has it.
+- Costs. Synchronous code that doesn't throw runs at the same speed. The
+  enabled debugger slows down asynchronous code and makes throwing more
+  expensive:
+  - each `await`: about 0.6 µs more (a tight `async` loop runs about 8×
+    slower); promise chains about 0.1 µs per step;
   - each `eval` (each script compiled): about 15 µs more;
   - each `throw` caught in JavaScript: about 0.5 µs more;
-  - a throw thousands of frames deep: tens of milliseconds, because V8
-    describes every frame;
+  - each recorded exception: typically 0.2 ms, at most about 100 ms of
+    recording. That includes a promise rejected while nothing handles it yet,
+    even if a handler is added later;
+  - before recording starts, V8 describes every frame and scope of the stack.
+    A throw thousands of frames deep, especially with many top-level
+    `let`/`const`, can take a second or more, and neither the 100 ms limit
+    nor `timeout:` covers it. A pause over 16 MB (throwing a 100-million
+    character string, say) isn't recorded;
   - an object with a million properties: about half a second, because V8
     lists them all before 50 are kept.
+
+  This makes capture mode a good fit for re-running a failed script, and
+  for editor and test runs. Measure it before turning it on for all
+  production traffic.
 - V8 caches a stack frame for each `console.*` call site in each script. A
   long-lived context that evaluates many different scripts that call `console`
   grows by about 180 bytes per such script until it is disposed.
