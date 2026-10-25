@@ -1,3 +1,7 @@
+- 0.22.2.5 - 25-10-2026
+  - DRM51 build: 0.22.2.3 plus the change below
+  - Add `Context.new(capture_on_throw: true)`: when an exception escapes to Ruby, `MiniRacer::RuntimeError#capture` holds each frame's function, script, line and column and its local variables, copied without running JavaScript by an in-process V8 inspector session. Opt-in. While enabled it slows compiling, `await` and throwing; see the README section "Locals of an uncaught exception" for its costs and limits
+
 - 0.22.2.3 - 25-10-2026
   - DRM51 build: 0.22.2.1 plus the change below
   - Add `Context.new(date: :iso)`, which passes a date-only `Date` to JavaScript as an ISO 8601 string (`"2026-10-25"`) instead of a `Date` at local midnight, and `Context.new(decimal: :float)`, which passes a `BigDecimal` as a number instead of `"Undefined Conversion"`. Both apply to attached function results and `Context#call` arguments; the defaults are unchanged
