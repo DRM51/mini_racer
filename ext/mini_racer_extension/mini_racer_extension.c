@@ -135,6 +135,7 @@ typedef struct Context
     // gets too complicated
     atomic_int quit;
     int verbose_exceptions;
+    int ser_opts;      // SER_* flags, set by Context.new(date:, decimal:)
     int64_t idle_gc, max_memory, timeout;
     struct State *pst; // used by v8 thread
     VALUE procs;       // array of js -> ruby callbacks
@@ -208,6 +209,7 @@ static VALUE snapshot_class;
 static VALUE date_class;
 static VALUE date_time_class;
 static VALUE binary_class;
+static VALUE big_decimal_class;
 static VALUE js_function_class;
 
 static pthread_mutex_t flags_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -616,7 +618,13 @@ static int serialize_bigint(Ser *s, VALUE v)
     return *s->err ? -1 : 0;
 }
 
-static int serialize1(Ser *s, VALUE refs, VALUE v, int depth)
+// how serialize() hands JS the Ruby values that have no exact JS type
+enum {
+    SER_DATE_ISO      = 1, // Date (not DateTime) as "YYYY-MM-DD", not a JS Date
+    SER_DECIMAL_FLOAT = 2, // BigDecimal as a number, not "Undefined Conversion"
+};
+
+static int serialize1(Ser *s, VALUE refs, VALUE v, int depth, int opts)
 {
     VALUE a, t, id;
     size_t i, n;
@@ -636,7 +644,7 @@ static int serialize1(Ser *s, VALUE refs, VALUE v, int depth)
                 rb_hash_aset(refs, obj_id, LONG2FIX(i));
                 ser_array_begin(s, n);
                 for (i = 0; i < n; i++)
-                    if (serialize1(s, refs, rb_ary_entry(v, i), depth + 1))
+                    if (serialize1(s, refs, rb_ary_entry(v, i), depth + 1, opts))
                         return -1;
                 ser_array_end(s, n);
             } else {
@@ -667,9 +675,9 @@ static int serialize1(Ser *s, VALUE refs, VALUE v, int depth)
                 if (i == 2*n) {
                     ser_object_begin(s);
                     for (i = 0; i < 2*n; i += 2) {
-                        if (serialize1(s, refs, rb_ary_entry(a, i+0), depth + 1))
+                        if (serialize1(s, refs, rb_ary_entry(a, i+0), depth + 1, opts))
                             return -1;
-                        if (serialize1(s, refs, rb_ary_entry(a, i+1), depth + 1))
+                        if (serialize1(s, refs, rb_ary_entry(a, i+1), depth + 1, opts))
                             return -1;
                     }
                     ser_object_end(s, n);
@@ -690,7 +698,20 @@ static int serialize1(Ser *s, VALUE refs, VALUE v, int depth)
         if (date_time_class == CLASS_OF(v)) {
             v = rb_funcall(v, rb_intern("to_time"), 0);
         } else if (date_class == CLASS_OF(v)) {
+            if (opts & SER_DATE_ISO) {
+                // a calendar day; to_time would make it local midnight,
+                // which is the previous day in UTC east of Greenwich
+                add_string(s, rb_funcall(v, rb_intern("iso8601"), 0));
+                break;
+            }
             v = rb_funcall(v, rb_intern("to_time"), 0);
+        } else if (opts & SER_DECIMAL_FLOAT) {
+            if (NIL_P(big_decimal_class) && rb_const_defined(rb_cObject, rb_intern("BigDecimal")))
+                big_decimal_class = rb_const_get(rb_cObject, rb_intern("BigDecimal"));
+            if (!NIL_P(big_decimal_class) && rb_obj_is_kind_of(v, big_decimal_class)) {
+                ser_num(s, NUM2DBL(rb_funcall(v, rb_intern("to_f"), 0)));
+                break;
+            }
         }
         if (rb_cTime == CLASS_OF(v)) {
             struct timeval tv = rb_time_timeval(v);
@@ -758,9 +779,9 @@ static int serialize1(Ser *s, VALUE refs, VALUE v, int depth)
 
 // don't mix with ser_array_begin/ser_object_begin because
 // that will throw off the object reference count
-static int serialize(Ser *s, VALUE v)
+static int serialize(Ser *s, VALUE v, int opts)
 {
-    return serialize1(s, rb_hash_new(), v, 0);
+    return serialize1(s, rb_hash_new(), v, 0, opts);
 }
 
 static struct timespec deadline_ms(int ms)
@@ -1041,13 +1062,14 @@ struct callback_serialize_args
 {
     Ser *ser;
     VALUE value;
+    int opts;
 };
 
 static VALUE callback_serialize(VALUE arg)
 {
     struct callback_serialize_args *args;
     args = (void *)arg;
-    return INT2FIX(serialize(args->ser, args->value));
+    return INT2FIX(serialize(args->ser, args->value, args->opts));
 }
 
 static VALUE callback_exception_to_s(VALUE exception)
@@ -1101,6 +1123,7 @@ static void *rendezvous_callback(void *arg)
     ser_init1(&s, 'c'); // callback reply
     args.ser = &s;
     args.value = r;
+    args.opts = c->ser_opts;
     r = rb_protect(callback_serialize, (VALUE)&args, &exc);
     if (exc) {
         // A Ruby conversion hook, Check_Type(), or stack overflow escaped
@@ -1805,7 +1828,7 @@ static VALUE context_call_common(int argc, VALUE *argv, VALUE self, char op)
     rb_ary_unshift(args, name);
     // request is (C)all or (D) call_await, [name, args...] array
     ser_init1(&s, op);
-    if (serialize(&s, args)) {
+    if (serialize(&s, args, c->ser_opts)) {
         ser_reset(&s);
         rb_raise(runtime_error, "Context.call: %s", s.err);
     }
@@ -2121,6 +2144,18 @@ static VALUE context_initialize(int argc, VALUE *argv, VALUE self)
             TypedData_Get_Struct(v, Snapshot, &snapshot_type, ss);
             if (buf_put(&c->snapshot, RSTRING_PTR(ss->blob), RSTRING_LENINT(ss->blob)))
                 rb_raise(runtime_error, "out of memory");
+        } else if (!strcmp(s, "date")) {
+            c->ser_opts &= ~SER_DATE_ISO;
+            if (v == ID2SYM(rb_intern("iso")))
+                c->ser_opts |= SER_DATE_ISO;
+            else if (!NIL_P(v) && v != ID2SYM(rb_intern("time")))
+                rb_raise(rb_eArgError, "bad date: expected :time or :iso");
+        } else if (!strcmp(s, "decimal")) {
+            c->ser_opts &= ~SER_DECIMAL_FLOAT;
+            if (v == ID2SYM(rb_intern("float")))
+                c->ser_opts |= SER_DECIMAL_FLOAT;
+            else if (!NIL_P(v))
+                rb_raise(rb_eArgError, "bad decimal: expected :float or nil");
         } else if (!strcmp(s, "verbose_exceptions")) {
             c->verbose_exceptions = !(v == Qfalse || v == Qnil);
         } else {
@@ -2335,5 +2370,6 @@ void Init_mini_racer_extension(void)
     date_class = Qnil; // lazy init
     date_time_class = Qnil; // lazy init
     binary_class = Qnil; // lazy init
+    big_decimal_class = Qnil; // lazy init
     js_function_class = rb_define_class_under(m, "JavaScriptFunction", rb_cObject);
 }
