@@ -4,6 +4,7 @@
 #include "libplatform/libplatform.h"
 #include "mini_racer_v8.h"
 #include "mini_racer_inspector.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -97,6 +98,7 @@ struct CapturedError
     v8::Global<v8::Value> record;
     v8::Global<v8::Value> exception;
     std::string bigint; // a thrown BigInt, as CDP spells it ("12n")
+    uint64_t invocation; // the eval or call running when it was recorded
 };
 
 struct State
@@ -130,6 +132,10 @@ struct State
     std::unique_ptr<Inspector> inspector;
     std::unique_ptr<Capture> capture;
     std::vector<CapturedError> captured;
+    // ids of the evals and calls in progress, innermost last; a record
+    // belongs to the innermost one, and only its error may claim it
+    std::vector<uint64_t> invocations;
+    uint64_t last_invocation = 0;
     int replying_depth = -1; // javascript_call_depth of a reply() in progress
     // true while the inspector runs frontend messages with no ruby call in
     // progress; js -> ruby callbacks have nobody to answer them then
@@ -1145,7 +1151,7 @@ struct CaptureWalk
         for (int i = 0; i < 4; i++) {
             auto name = f->GetDebugName();
             if (name->IsString() && name.As<v8::String>()->Length() > 0)
-                return prefix + utf8(name);
+                return prefix + utf8(truncated(name.As<v8::String>()));
             auto target = f->GetBoundFunction();
             if (!target->IsFunction())
                 return prefix;
@@ -1164,7 +1170,7 @@ struct CaptureWalk
             {v8::RegExp::kUnicode, 'u'}, {v8::RegExp::kUnicodeSets, 'v'},
             {v8::RegExp::kSticky, 'y'},
         };
-        std::string s = "/" + utf8(re->GetSource()) + "/";
+        std::string s = "/" + utf8(truncated(re->GetSource())) + "/";
         for (auto& [flag, c] : flags)
             if (re->GetFlags() & flag) s += c;
         return s;
@@ -1191,7 +1197,7 @@ struct CaptureWalk
         if (v->IsString()) return truncated(v.As<v8::String>());
         if (v->IsSymbol()) {
             auto d = v.As<v8::Symbol>()->Description(st.isolate);
-            return truncated(str("Symbol(" + (d->IsString() ? utf8(d) : std::string()) + ")"));
+            return str("Symbol(" + (d->IsString() ? utf8(truncated(d.As<v8::String>())) : std::string()) + ")");
         }
         if (v->IsProxy()) return str("[Proxy]");
         if (v->IsFunction()) {
@@ -1222,7 +1228,7 @@ struct CaptureWalk
             bool accessor = false;
             std::string text = cls;
             if (own_value(o, str("message"), &message, &accessor) && !accessor && message->IsString())
-                text += ": " + utf8(message);
+                text += ": " + utf8(truncated(message.As<v8::String>()));
             return truncated(str(text));
         }
         for (auto& seen_o : path)
@@ -1321,8 +1327,13 @@ struct CaptureWalk
             auto name = name_v.As<v8::String>();
             bool accessor = false;
             if (!own_value(o, name, &val, &accessor)) continue;
-            auto key = name->Length() > static_cast<int>(kCaptureString)
-                ? truncated(name).As<v8::String>() : name;
+            auto key = name;
+            if (name->Length() > static_cast<int>(kCaptureString)) {
+                key = truncated(name).As<v8::String>();
+                // two long names can shorten to the same key
+                if (out->HasOwnProperty(st.safe_context, key).FromMaybe(false))
+                    key = v8::String::Concat(st.isolate, key, str(" #" + std::to_string(i)));
+            }
             put(out, key, accessor ? getter() : value(val, depth + 1));
             kept++;
         }
@@ -1475,7 +1486,8 @@ void capture_record(Capture& cap, const std::string& message)
     auto record = walk.new_object();
     walk.put(record, walk.str("reason"), get_field(sc, params, "reason"));
     walk.put(record, walk.str("frames"), out_frames);
-    if (walk.stopped)
+    // a single large value can carry recording past the deadline
+    if (walk.stopped || std::chrono::steady_clock::now() > walk.deadline)
         walk.put(record, walk.str("truncated"), v8::True(st.isolate));
     // a later pause (another rejection, say) must not push this one out
     // before its error claims it
@@ -1485,6 +1497,7 @@ void capture_record(Capture& cap, const std::string& message)
     st.captured.back().record.Reset(st.isolate, record);
     st.captured.back().exception.Reset(st.isolate, exception);
     st.captured.back().bigint = bigint;
+    st.captured.back().invocation = st.invocations.empty() ? 0 : st.invocations.back();
 }
 
 void CaptureClient::runMessageLoopOnPause(int)
@@ -1509,30 +1522,35 @@ bool same_exception(State& st, const CapturedError& c, v8::Local<v8::Value> thro
 }
 
 // Appends to a runtime error's [message, stack] the record of the pause for
-// this very exception, if any. The newest matching record wins: two throws
-// of an equal primitive can only be told apart by order. An outermost eval
-// or call then drops all records; a nested one takes only its own, leaving
-// those of the evaluation that called it.
+// this very exception, if exactly one record of this eval or call matches
+// it: two throws of an equal value (two rejections with 404, say) can't be
+// told apart, and a wrong record is worse than none. Then drops this
+// evaluation's records, and if it's the outermost one, all records.
 v8::Local<v8::Value> with_capture(State& st, v8::TryCatch *try_catch, int cause,
                                   bool nested, v8::Local<v8::Value> err)
 {
     if (st.captured.empty())
         return err;
+    uint64_t self = st.invocations.empty() ? 0 : st.invocations.back();
     v8::Local<v8::Value> record;
+    int matches = 0;
     auto thrown = try_catch->Exception();
     if (cause == RUNTIME_ERROR && !thrown.IsEmpty()) {
-        for (auto it = st.captured.rbegin(); it != st.captured.rend(); ++it) {
-            if (same_exception(st, *it, thrown)) {
-                record = v8::Local<v8::Value>::New(st.isolate, it->record);
-                if (nested)
-                    st.captured.erase(std::next(it).base());
-                break;
+        for (auto& c : st.captured) {
+            if (c.invocation == self && same_exception(st, c, thrown)) {
+                record = v8::Local<v8::Value>::New(st.isolate, c.record);
+                matches++;
             }
         }
     }
-    if (!nested)
+    if (nested) {
+        st.captured.erase(std::remove_if(st.captured.begin(), st.captured.end(),
+                                         [self](const CapturedError& c) { return c.invocation == self; }),
+                          st.captured.end());
+    } else {
         st.captured.clear();
-    if (record.IsEmpty())
+    }
+    if (matches != 1)
         return err;
     if (err->IsArray()) {
         auto fields = err.As<v8::Array>();
@@ -1544,6 +1562,14 @@ v8::Local<v8::Value> with_capture(State& st, v8::TryCatch *try_catch, int cause,
     v8::Context::Scope context_scope(st.safe_context);
     return v8::Array::New(st.isolate, fields, 3);
 }
+
+// Marks an eval or call as in progress for the records it makes.
+struct InvocationScope
+{
+    State& st;
+    explicit InvocationScope(State& st) : st(st) { st.invocations.push_back(++st.last_invocation); }
+    ~InvocationScope() { st.invocations.pop_back(); }
+};
 
 extern "C" State *v8_thread_init(Context *c, const uint8_t *snapshot_buf,
                                  size_t snapshot_len, int64_t max_memory,
@@ -1819,6 +1845,7 @@ void v8_call_impl(State *pst, const uint8_t *p, size_t n, bool await)
     bool preserve_termination = false;
     bool nested = st.javascript_call_depth > 0;
     JavascriptCallScope call_scope(st.javascript_call_depth);
+    InvocationScope invocation(st);
     if (!nested) st.captured.clear(); // left by microtasks run while idle
     if (await && nested) {
         throw_nested_await_call(st);
@@ -1945,6 +1972,7 @@ void v8_eval_impl(State *pst, const uint8_t *p, size_t n, bool await)
     bool preserve_termination = false;
     bool nested = st.javascript_call_depth > 0;
     JavascriptCallScope call_scope(st.javascript_call_depth);
+    InvocationScope invocation(st);
     if (!nested) st.captured.clear(); // left by microtasks run while idle
     if (await && nested) {
         throw_nested_await_call(st);
