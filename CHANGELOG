@@ -1,3 +1,7 @@
+- 0.22.2.2 - 25-10-2026
+  - DRM51 build: 0.22.2.1 on V8 14.6 (Node 26). Requires libv8-node ~> 26.12.1.0, published at https://drm51.github.io/gems
+  - Replace `String::WriteOneByte`, removed in V8 14, with `WriteOneByteV2`
+
 - 0.22.2.1 - 25-10-2026
   - DRM51 build: upstream 0.22.2 and its unreleased fixes, plus the changes below. The fourth version segment numbers our builds; upstream does not use it
   - Add remote debugging with Chrome DevTools: `MiniRacer::Inspector.start(port:, host:, token:, allow_remote:)`, `Context.new(inspector:, max_pause:)`, `Context#wait_for_debugger`, `Context#debugger_attached?`, `Inspector.url`

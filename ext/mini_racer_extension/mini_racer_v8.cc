@@ -1816,11 +1816,10 @@ extern "C" void v8_warmup(State *pst, const uint8_t *p, size_t n)
         if (!blob_data_v->ToString(st.context).ToLocal(&blob_data)) goto fail;
         assert(blob_data->IsOneByte());
         assert(blob_data->ContainsOnlyOneByte());
-        if (const size_t len = blob_data->Length()) {
-            auto flags = v8::String::NO_NULL_TERMINATION
-                       | v8::String::PRESERVE_ONE_BYTE_NULL;
+        if (const uint32_t len = blob_data->Length()) {
+            // copies the bytes verbatim, NULs included, without a terminator
             storage.resize(len);
-            blob_data->WriteOneByte(st.isolate, storage.data(), 0, len, flags);
+            blob_data->WriteOneByteV2(st.isolate, 0, len, storage.data());
         }
         v8::Local<v8::Value> code_v;
         if (!request->Get(st.context, 1).ToLocal(&code_v)) goto fail;
