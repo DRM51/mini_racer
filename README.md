@@ -258,6 +258,8 @@ end
   waiting on (`"reason" => "promiseRejection"`). Exceptions caught in
   JavaScript are not recorded. A Ruby exception raised by an attached function
   propagates unchanged, without a capture.
+- Up to 8 recorded exceptions wait for the error they belong to; a ninth (a
+  ninth unhandled rejection, say) pushes out the oldest.
 - Up to 10 frames, innermost first; `line` and `column` count from 1 and match
   the backtrace. Each frame's scopes are listed innermost first (`block`,
   `local`, `closure`, `script` for top-level `let`/`const`, ...), never
@@ -284,24 +286,26 @@ end
   one thrown inside a `try` in an outer script, around the Ruby callback that
   made the nested `eval`, isn't recorded. The `script` scope (top-level
   `let`/`const`) is listed once, in the first frame that has it.
-- Costs. Synchronous code that doesn't throw runs at the same speed once
+- Costs (measured on an Apple Silicon Mac; ratios vary with load and
+  machine). Synchronous code that doesn't throw runs at the same speed once
   compiled. The enabled debugger slows down compiling, asynchronous code and
   throwing:
-  - each `await`: about 0.6 µs more (a tight `async` loop runs about 8×
-    slower); promise chains about 0.1 µs per step;
+  - each `await`: about 0.5 µs more (a tight `async` loop runs 8–13× slower);
+    promise chains about 0.1 µs per step;
   - compiling: V8 turns its compilation cache off while a debugger is
-    enabled, so each `eval` compiles its source again (about 15 µs plus
-    13 µs per KB of source more than a cached compile), and `new Function`
-    or `eval` called in a loop runs up to about 60× slower;
-  - each `throw` caught in JavaScript: about 0.5 µs more;
+    enabled, so each `eval` compiles its source again (tens of µs, plus about
+    15–30 µs per KB of source, more than a cached compile), and
+    `new Function` or `eval` called in a loop runs 50–150× slower;
+  - each `throw` caught in JavaScript: about 0.5–1 µs more;
   - each recorded exception: typically 0.2 ms, at most about 100 ms of
     recording. That includes a promise rejected while nothing handles it yet,
     even if a handler is added later;
   - before recording starts, V8 describes every frame and scope of the stack.
     A throw thousands of frames deep, especially with many top-level
     `let`/`const`, can take a second or more, and neither the 100 ms limit
-    nor `timeout:` covers it. A pause over 16 MB (throwing a 100-million
-    character string, say) isn't recorded;
+    nor `timeout:` covers it. A pause V8 describes in over 16 MB of JSON
+    isn't recorded: a thrown string of a few million characters (six bytes
+    each when they aren't ASCII), say;
   - an object with a million properties: about half a second, because V8
     lists them all before 50 are kept.
 
