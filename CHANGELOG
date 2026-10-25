@@ -1,3 +1,7 @@
+- 0.22.2.7 - 25-10-2026
+  - DRM51 build: 0.22.2.5 plus the change below
+  - capture_on_throw: a record attaches only to the error of the eval or call it was made in, and not at all when two records of that evaluation match the thrown value; long Symbol descriptions, function names and error messages are shortened before they are converted; long property names that shorten alike no longer overwrite each other
+
 - 0.22.2.5 - 25-10-2026
   - DRM51 build: 0.22.2.3 plus the change below
   - Add `Context.new(capture_on_throw: true)`: when an exception escapes to Ruby, `MiniRacer::RuntimeError#capture` holds each frame's function, script, line and column and its local variables, copied without running JavaScript by an in-process V8 inspector session. Opt-in. While enabled it slows compiling, `await` and throwing; see the README section "Locals of an uncaught exception" for its costs and limits
