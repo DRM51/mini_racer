@@ -88,6 +88,14 @@ enum : unsigned
 struct Inspector; // defined below, only exists when Context.new(inspector:)
 struct Capture;   // defined below, only exists when Context.new(capture_on_throw:)
 
+// what an uncaught exception's pause recorded, and that exception, so the
+// failing eval or call can find the record that belongs to its error
+struct CapturedError
+{
+    v8::Global<v8::Value> record;
+    v8::Global<v8::Value> exception;
+};
+
 struct State
 {
     v8::Isolate *isolate;
@@ -118,10 +126,8 @@ struct State
     std::unique_ptr<v8::ArrayBuffer::Allocator> allocator;
     std::unique_ptr<Inspector> inspector;
     std::unique_ptr<Capture> capture;
-    // what the last uncaught exception's pause recorded, and that exception,
-    // so a failing eval or call can tell the capture belongs to its error
-    v8::Global<v8::Value> captured;
-    v8::Global<v8::Value> captured_exception;
+    std::vector<CapturedError> captured;
+    int replying = 0; // reply() is serializing a result
     // true while the inspector runs frontend messages with no ruby call in
     // progress; js -> ruby callbacks have nobody to answer them then
     bool inspector_idle;
@@ -272,6 +278,11 @@ bool bubble_up_ruby_exception(State& st, v8::TryCatch *try_catch)
 // throws JS exception on serialization error
 bool reply(State& st, v8::Local<v8::Value> v)
 {
+    struct Replying {
+        int& n;
+        explicit Replying(int& n) : n(n) { n++; }
+        ~Replying() { n--; }
+    } replying(st.replying);
     v8::TryCatch try_catch(st.isolate);
     {
         Serialized serialized(st, v);
@@ -855,6 +866,9 @@ constexpr int kCaptureDepth = 3;         // nesting below a variable
 constexpr uint32_t kCaptureItems = 50;   // properties or elements per object
 constexpr uint32_t kCaptureString = 500; // UTF-16 units kept of a string
 constexpr int kCaptureValues = 5000;     // values recorded per exception
+constexpr int kCaptureMillis = 100;      // time spent recording per exception
+constexpr size_t kCaptureCollection = 10000; // larger Maps and Sets: just the size
+constexpr size_t kCaptureRecords = 8;    // pauses waiting for their error
 
 struct CaptureClient final : public v8_inspector::V8InspectorClient
 {
@@ -941,8 +955,7 @@ void capture_after_eval(State& st)
     Capture *cap = st.capture.get();
     if (!cap)
         return;
-    st.captured.Reset();
-    st.captured_exception.Reset();
+    st.captured.clear();
     if (cap->console_dirty) {
         cap->console_dirty = false;
         capture_dispatch(*cap, "{\"id\":3,\"method\":\"Runtime.discardConsoleEntries\"}");
@@ -963,6 +976,8 @@ void capture_init(State& st)
     // scripts are only looked up while paused; keep none after they're collected
     capture_dispatch(cap, "{\"id\":1,\"method\":\"Debugger.enable\",\"params\":{\"maxScriptsCacheSize\":0}}");
     capture_dispatch(cap, "{\"id\":2,\"method\":\"Debugger.setPauseOnExceptions\",\"params\":{\"state\":\"uncaught\"}}");
+    // debugger; statements would pause too, for nothing
+    capture_dispatch(cap, "{\"id\":4,\"method\":\"Debugger.setBreakpointsActive\",\"params\":{\"active\":false}}");
 }
 
 void capture_teardown(State& st)
@@ -994,9 +1009,33 @@ struct CaptureWalk
     State& st;
     v8::Local<v8::Context> context; // where the inspected values live
     int budget = kCaptureValues;
+    // each object is recorded once; later references share that record
+    v8::Local<v8::Map> seen;
     std::vector<v8::Local<v8::Object>> path; // for [Circular]
+    std::chrono::steady_clock::time_point deadline;
+    unsigned ticks = 0;
+    bool stopped = false;
 
-    CaptureWalk(State& st, v8::Local<v8::Context> context) : st(st), context(context) {}
+    CaptureWalk(State& st, v8::Local<v8::Context> context)
+        : st(st), context(context),
+          deadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(kCaptureMillis))
+    {
+        v8::Context::Scope scope(st.safe_context);
+        seen = v8::Map::New(st.isolate);
+    }
+
+    // out of values or time, or the script is being terminated (timeout,
+    // Context#stop): what's left is recorded as [...]
+    bool exhausted()
+    {
+        if (!stopped && (--budget < 0 ||
+                         ((++ticks & 31) == 0 &&
+                          (st.terminate_requested.load() ||
+                           st.isolate->IsExecutionTerminating() ||
+                           std::chrono::steady_clock::now() > deadline))))
+            stopped = true;
+        return stopped;
+    }
 
     v8::Local<v8::String> str(const std::string& s)
     {
@@ -1025,6 +1064,18 @@ struct CaptureWalk
     {
         v8::Context::Scope scope(st.safe_context);
         return v8::Object::New(st.isolate);
+    }
+
+    // CreateDataProperty, unlike Set, can't run the safe context's setters
+    // (a "__proto__" key would otherwise vanish)
+    void put(v8::Local<v8::Object> o, v8::Local<v8::Name> key, v8::Local<v8::Value> v)
+    {
+        o->CreateDataProperty(st.safe_context, key, v).FromMaybe(false);
+    }
+
+    void put(v8::Local<v8::Object> o, uint32_t index, v8::Local<v8::Value> v)
+    {
+        o->CreateDataProperty(st.safe_context, index, v).FromMaybe(false);
     }
 
     v8::Local<v8::Value> truncated(v8::Local<v8::String> s)
@@ -1058,12 +1109,42 @@ struct CaptureWalk
         return desc->Get(context, value_key).ToLocal(value);
     }
 
+    std::string function_name(v8::Local<v8::Function> f)
+    {
+        auto name = f->GetDebugName();
+        if (name->IsString() && name.As<v8::String>()->Length() > 0)
+            return utf8(name);
+        auto target = f->GetBoundFunction();
+        if (target->IsFunction())
+            return "bound " + function_name(target.As<v8::Function>());
+        return std::string();
+    }
+
+    std::string regexp(v8::Local<v8::RegExp> re)
+    {
+        static const std::pair<v8::RegExp::Flags, char> flags[] = {
+            {v8::RegExp::kHasIndices, 'd'}, {v8::RegExp::kGlobal, 'g'},
+            {v8::RegExp::kIgnoreCase, 'i'}, {v8::RegExp::kLinear, 'l'},
+            {v8::RegExp::kMultiline, 'm'}, {v8::RegExp::kDotAll, 's'},
+            {v8::RegExp::kUnicode, 'u'}, {v8::RegExp::kUnicodeSets, 'v'},
+            {v8::RegExp::kSticky, 'y'},
+        };
+        std::string s = "/" + utf8(re->GetSource()) + "/";
+        for (auto& [flag, c] : flags)
+            if (re->GetFlags() & flag) s += c;
+        return s;
+    }
+
     v8::Local<v8::Value> value(v8::Local<v8::Value> v, int depth)
     {
-        if (--budget < 0) return str("[\xE2\x80\xA6]");
-        if (v->IsUndefined() || v->IsNull() || v->IsBoolean() || v->IsNumber() ||
-            v->IsBigInt() || v->IsDate())
+        if (exhausted()) return str("[\xE2\x80\xA6]");
+        if (v->IsUndefined() || v->IsNull() || v->IsBoolean() || v->IsNumber() || v->IsDate())
             return v;
+        if (v->IsBigInt()) {
+            int words = v.As<v8::BigInt>()->WordCount();
+            if (words <= 16) return v;
+            return str("[BigInt: " + std::to_string(64 * words) + " bits]");
+        }
         if (v->IsString()) return truncated(v.As<v8::String>());
         if (v->IsSymbol()) {
             auto d = v.As<v8::Symbol>()->Description(st.isolate);
@@ -1071,20 +1152,27 @@ struct CaptureWalk
         }
         if (v->IsProxy()) return str("[Proxy]");
         if (v->IsFunction()) {
-            auto name = utf8(v.As<v8::Function>()->GetDebugName());
+            auto name = function_name(v.As<v8::Function>());
             return str("[Function" + (name.empty() ? std::string() : ": " + name) + "]");
         }
-        if (v->IsRegExp()) return truncated(v.As<v8::RegExp>()->GetSource());
+        if (v->IsRegExp()) return truncated(str(regexp(v.As<v8::RegExp>())));
         if (v->IsPromise()) {
             static const char *states[] = {"pending", "fulfilled", "rejected"};
             return str(std::string("[Promise ") + states[v.As<v8::Promise>()->State()] + "]");
         }
+        // new String("...") etc.: the wrapped primitive, not one key per character
+        if (v->IsStringObject()) return truncated(v.As<v8::StringObject>()->ValueOf());
+        if (v->IsNumberObject())
+            return v8::Number::New(st.isolate, v.As<v8::NumberObject>()->ValueOf());
+        if (v->IsBooleanObject())
+            return v8::Boolean::New(st.isolate, v.As<v8::BooleanObject>()->ValueOf());
         if (!v->IsObject()) return str("[unknown]");
         auto o = v.As<v8::Object>();
         std::string cls = utf8(o->GetConstructorName());
         if (cls.empty()) cls = "Object";
         if (v->IsArrayBufferView() || v->IsArrayBuffer() || v->IsSharedArrayBuffer() ||
-            v->IsWeakMap() || v->IsWeakSet() || v->IsWeakRef())
+            v->IsWeakMap() || v->IsWeakSet() || v->IsWeakRef() || v->IsSymbolObject() ||
+            v->IsBigIntObject())
             return str("[" + cls + "]");
         if (v->IsNativeError()) {
             v8::Local<v8::Value> message;
@@ -1094,10 +1182,18 @@ struct CaptureWalk
                 text += ": " + utf8(message);
             return truncated(str(text));
         }
-        for (auto& seen : path)
-            if (seen->StrictEquals(o)) return str("[Circular]");
+        for (auto& seen_o : path)
+            if (seen_o->StrictEquals(o)) return str("[Circular]");
+        v8::Local<v8::Value> prior;
+        if (seen->Get(st.safe_context, o).ToLocal(&prior) && !prior->IsUndefined())
+            return prior;
         if (depth >= kCaptureDepth)
             return str(v->IsArray() ? "[Array]" : "[" + cls + "]");
+        if ((v->IsMap() && v.As<v8::Map>()->Size() > kCaptureCollection) ||
+            (v->IsSet() && v.As<v8::Set>()->Size() > kCaptureCollection)) {
+            size_t n = v->IsMap() ? v.As<v8::Map>()->Size() : v.As<v8::Set>()->Size();
+            return str("[" + cls + "(" + std::to_string(n) + ")]");
+        }
         path.push_back(o);
         v8::Local<v8::Value> r;
         if (v->IsMap() || v->IsSet())
@@ -1107,16 +1203,19 @@ struct CaptureWalk
         else
             r = object(o, depth);
         path.pop_back();
+        if (!stopped)
+            seen->Set(st.safe_context, o, r).IsEmpty();
         return r;
     }
 
     // a Map as [[key, value], ...], a Set as [value, ...]
     v8::Local<v8::Value> collection(v8::Local<v8::Object> o, int depth)
     {
+        v8::EscapableHandleScope scope(st.isolate);
         bool pairs = false;
         v8::Local<v8::Array> entries;
         auto out = new_array();
-        if (!o->PreviewEntries(&pairs).ToLocal(&entries)) return out;
+        if (!o->PreviewEntries(&pairs).ToLocal(&entries)) return scope.Escape(out);
         uint32_t n = entries->Length(), step = pairs ? 2 : 1;
         uint32_t j = 0;
         for (uint32_t i = 0; i + step - 1 < n && j < kCaptureItems; i += step, j++) {
@@ -1124,24 +1223,22 @@ struct CaptureWalk
             if (!entries->Get(context, i).ToLocal(&k)) break;
             if (pairs) {
                 if (!entries->Get(context, i + 1).ToLocal(&val)) break;
-                v8::Local<v8::Value> kv[] = {value(k, depth + 1), value(val, depth + 1)};
-                v8::Local<v8::Array> pair;
-                {
-                    v8::Context::Scope scope(st.safe_context);
-                    pair = v8::Array::New(st.isolate, kv, 2);
-                }
-                out->Set(st.safe_context, j, pair).FromMaybe(false);
+                auto pair = new_array();
+                put(pair, 0, value(k, depth + 1));
+                put(pair, 1, value(val, depth + 1));
+                put(out, j, pair);
             } else {
-                out->Set(st.safe_context, j, value(k, depth + 1)).FromMaybe(false);
+                put(out, j, value(k, depth + 1));
             }
         }
         if (n / step > j)
-            out->Set(st.safe_context, j, str("\xE2\x80\xA6 " + std::to_string(n / step - j) + " more")).FromMaybe(false);
-        return out;
+            put(out, j, str("\xE2\x80\xA6 " + std::to_string(n / step - j) + " more"));
+        return scope.Escape(out);
     }
 
     v8::Local<v8::Value> array(v8::Local<v8::Array> a, int depth)
     {
+        v8::EscapableHandleScope scope(st.isolate);
         uint32_t n = a->Length();
         auto out = new_array();
         uint32_t j = 0;
@@ -1152,40 +1249,38 @@ struct CaptureWalk
             if (!v8::Integer::NewFromUnsigned(st.isolate, j)->ToString(context).ToLocal(&key) ||
                 !own_value(a, key, &val, &accessor))
                 val = v8::Undefined(st.isolate);
-            out->Set(st.safe_context, j,
-                     accessor ? str("[Getter]").As<v8::Value>() : value(val, depth + 1)).FromMaybe(false);
+            put(out, j, accessor ? str("[Getter]").As<v8::Value>() : value(val, depth + 1));
         }
         if (n > j)
-            out->Set(st.safe_context, j, str("\xE2\x80\xA6 " + std::to_string(n - j) + " more")).FromMaybe(false);
-        return out;
+            put(out, j, str("\xE2\x80\xA6 " + std::to_string(n - j) + " more"));
+        return scope.Escape(out);
     }
 
     // own enumerable string-keyed properties; a debugger scope object's
     // properties are its variables
     v8::Local<v8::Value> object(v8::Local<v8::Object> o, int depth)
     {
+        v8::EscapableHandleScope scope(st.isolate);
         auto out = new_object();
         v8::Local<v8::Array> names;
         auto filter = static_cast<v8::PropertyFilter>(v8::ONLY_ENUMERABLE | v8::SKIP_SYMBOLS);
         if (!o->GetOwnPropertyNames(context, filter, v8::KeyConversionMode::kConvertToString).ToLocal(&names))
-            return out;
+            return scope.Escape(out);
         uint32_t n = names->Length(), kept = 0;
         for (uint32_t i = 0; i < n; i++) {
             v8::Local<v8::Value> name_v, val;
             if (!names->Get(context, i).ToLocal(&name_v) || !name_v->IsString()) continue;
             if (kept == kCaptureItems) {
-                out->Set(st.safe_context, str("\xE2\x80\xA6"),
-                         str(std::to_string(n - i) + " more")).FromMaybe(false);
+                put(out, str("\xE2\x80\xA6"), str(std::to_string(n - i) + " more"));
                 break;
             }
             auto name = name_v.As<v8::String>();
             bool accessor = false;
             if (!own_value(o, name, &val, &accessor)) continue;
-            out->Set(st.safe_context, name,
-                     accessor ? str("[Getter]").As<v8::Value>() : value(val, depth + 1)).FromMaybe(false);
+            put(out, name, accessor ? str("[Getter]").As<v8::Value>() : value(val, depth + 1));
             kept++;
         }
-        return out;
+        return scope.Escape(out);
     }
 };
 
@@ -1211,9 +1306,41 @@ bool unwrap(Capture& cap, v8::Local<v8::Value> remote, v8::Local<v8::Value> *out
         out, &context, &group);
 }
 
+// The thrown value a Debugger.paused event describes: an object by its id,
+// a primitive by value. False when it can't be rebuilt exactly (a BigInt).
+bool thrown_value(Capture& cap, CaptureWalk& walk, v8::Local<v8::Value> data,
+                  v8::Local<v8::Value> *out)
+{
+    State& st = cap.st;
+    auto sc = st.safe_context;
+    if (unwrap(cap, data, out)) return true;
+    if (walk.utf8(get_field(sc, data, "type")) == "undefined") {
+        *out = v8::Undefined(st.isolate);
+        return true;
+    }
+    if (data->IsObject() &&
+        data.As<v8::Object>()->HasOwnProperty(sc, walk.str("value")).FromMaybe(false)) {
+        *out = get_field(sc, data, "value");
+        return true;
+    }
+    std::string u = walk.utf8(get_field(sc, data, "unserializableValue"));
+    double d;
+    if (u == "NaN") d = std::numeric_limits<double>::quiet_NaN();
+    else if (u == "Infinity") d = std::numeric_limits<double>::infinity();
+    else if (u == "-Infinity") d = -std::numeric_limits<double>::infinity();
+    else if (u == "-0") d = -0.0;
+    else return false;
+    *out = v8::Number::New(st.isolate, d);
+    return true;
+}
+
 void capture_record(Capture& cap, const std::string& message)
 {
     State& st = cap.st;
+    // reply() serializing a result can run getters; an exception they cause
+    // belongs to no evaluation's error
+    if (st.replying)
+        return;
     v8::HandleScope handle_scope(st.isolate);
     v8::TryCatch try_catch(st.isolate); // best effort; never disturbs the exception
     // CDP leaves a frame's url empty and names scripts only in scriptParsed
@@ -1237,13 +1364,12 @@ void capture_record(Capture& cap, const std::string& message)
     auto data = get_field(sc, params, "data");
     if (!get_field(sc, data, "uncaught")->IsTrue()) return;
     v8::Local<v8::Value> exception;
-    if (!unwrap(cap, data, &exception))
-        exception = get_field(sc, data, "value"); // a thrown primitive; NaN,
-                                                  // -0 etc. come back undefined
+    if (!thrown_value(cap, walk, data, &exception)) return;
     auto frames_v = get_field(sc, params, "callFrames");
     if (!frames_v->IsArray()) return;
     auto frames = frames_v.As<v8::Array>();
     auto out_frames = walk.new_array();
+    bool script_scope_done = false; // top-level let/const: the same in every frame
     for (uint32_t i = 0, n = frames->Length(); i < n && i < kCaptureFrames; i++) {
         v8::Local<v8::Value> frame;
         if (!frames->Get(sc, i).ToLocal(&frame)) break;
@@ -1251,17 +1377,17 @@ void capture_record(Capture& cap, const std::string& message)
         auto line = get_field(sc, location, "lineNumber");
         auto column = get_field(sc, location, "columnNumber");
         auto out = walk.new_object();
-        out->Set(sc, walk.str("function"), get_field(sc, frame, "functionName")).FromMaybe(false);
+        walk.put(out, walk.str("function"), get_field(sc, frame, "functionName"));
         v8::Local<v8::Value> url = v8::String::Empty(st.isolate);
         int script_id = atoi(walk.utf8(get_field(sc, location, "scriptId")).c_str());
         for (auto& [id, name] : script_names)
             if (id == script_id) { url = name; break; }
-        out->Set(sc, walk.str("url"), url).FromMaybe(false);
+        walk.put(out, walk.str("url"), url);
         // CDP counts from 0; stack traces and editors from 1
         if (line->IsNumber())
-            out->Set(sc, walk.str("line"), v8::Number::New(st.isolate, line.As<v8::Number>()->Value() + 1)).FromMaybe(false);
+            walk.put(out, walk.str("line"), v8::Number::New(st.isolate, line.As<v8::Number>()->Value() + 1));
         if (column->IsNumber())
-            out->Set(sc, walk.str("column"), v8::Number::New(st.isolate, column.As<v8::Number>()->Value() + 1)).FromMaybe(false);
+            walk.put(out, walk.str("column"), v8::Number::New(st.isolate, column.As<v8::Number>()->Value() + 1));
         auto scopes_v = get_field(sc, frame, "scopeChain");
         auto out_scopes = walk.new_array();
         uint32_t k = 0;
@@ -1272,27 +1398,37 @@ void capture_record(Capture& cap, const std::string& message)
                 if (!scopes->Get(sc, j).ToLocal(&scope)) break;
                 std::string type = walk.utf8(get_field(sc, scope, "type"));
                 if (type == "global") continue; // all of globalThis
+                if (type == "script") {
+                    if (script_scope_done) continue;
+                    script_scope_done = true;
+                }
                 if (!unwrap(cap, get_field(sc, scope, "object"), &object) || !object->IsObject())
                     continue;
                 auto out_scope = walk.new_object();
-                out_scope->Set(sc, walk.str("type"), walk.str(type)).FromMaybe(false);
+                walk.put(out_scope, walk.str("type"), walk.str(type));
                 auto name = get_field(sc, scope, "name");
                 if (name->IsString())
-                    out_scope->Set(sc, walk.str("name"), name).FromMaybe(false);
+                    walk.put(out_scope, walk.str("name"), name);
                 // a scope's variables count as the first level
-                out_scope->Set(sc, walk.str("variables"),
-                               walk.object(object.As<v8::Object>(), -1)).FromMaybe(false);
-                out_scopes->Set(sc, k++, out_scope).FromMaybe(false);
+                walk.put(out_scope, walk.str("variables"), walk.object(object.As<v8::Object>(), -1));
+                walk.put(out_scopes, k++, out_scope);
             }
         }
-        out->Set(sc, walk.str("scopes"), out_scopes).FromMaybe(false);
-        out_frames->Set(sc, i, out).FromMaybe(false);
+        walk.put(out, walk.str("scopes"), out_scopes);
+        walk.put(out_frames, i, out);
     }
     auto record = walk.new_object();
-    record->Set(sc, walk.str("reason"), get_field(sc, params, "reason")).FromMaybe(false);
-    record->Set(sc, walk.str("frames"), out_frames).FromMaybe(false);
-    st.captured.Reset(st.isolate, record);
-    st.captured_exception.Reset(st.isolate, exception);
+    walk.put(record, walk.str("reason"), get_field(sc, params, "reason"));
+    walk.put(record, walk.str("frames"), out_frames);
+    if (walk.stopped)
+        walk.put(record, walk.str("truncated"), v8::True(st.isolate));
+    // a later pause (another rejection, say) must not push this one out
+    // before its error claims it
+    if (st.captured.size() == kCaptureRecords)
+        st.captured.erase(st.captured.begin());
+    st.captured.emplace_back();
+    st.captured.back().record.Reset(st.isolate, record);
+    st.captured.back().exception.Reset(st.isolate, exception);
 }
 
 void CaptureClient::runMessageLoopOnPause(int)
@@ -1304,29 +1440,33 @@ void CaptureClient::runMessageLoopOnPause(int)
     // returning resumes; there is no frontend to wait for
 }
 
-// Appends the capture to a runtime error's [message, stack] when it was
-// recorded for this very exception, and drops it either way.
+// Appends to a runtime error's [message, stack] the record of the pause for
+// this very exception, if any, and drops all records.
 v8::Local<v8::Value> with_capture(State& st, v8::TryCatch *try_catch, int cause,
                                   v8::Local<v8::Value> err)
 {
-    if (st.captured.IsEmpty())
+    if (st.captured.empty())
         return err;
-    auto captured = v8::Local<v8::Value>::New(st.isolate, st.captured);
-    auto exception = v8::Local<v8::Value>::New(st.isolate, st.captured_exception);
-    st.captured.Reset();
-    st.captured_exception.Reset();
+    v8::Local<v8::Value> record;
     auto thrown = try_catch->Exception();
-    bool same = !thrown.IsEmpty() &&
-        (thrown->SameValue(exception) || (exception->IsUndefined() && !thrown->IsObject()));
-    if (cause != RUNTIME_ERROR || !same)
+    if (cause == RUNTIME_ERROR && !thrown.IsEmpty()) {
+        for (auto& c : st.captured) {
+            if (thrown->SameValue(v8::Local<v8::Value>::New(st.isolate, c.exception))) {
+                record = v8::Local<v8::Value>::New(st.isolate, c.record);
+                break;
+            }
+        }
+    }
+    st.captured.clear();
+    if (record.IsEmpty())
         return err;
     if (err->IsArray()) {
         auto fields = err.As<v8::Array>();
-        fields->Set(st.safe_context, fields->Length(), captured).FromMaybe(false);
+        fields->CreateDataProperty(st.safe_context, fields->Length(), record).FromMaybe(false);
         return err;
     }
     // a thrown primitive has no stack, so its error is the bare message
-    v8::Local<v8::Value> fields[] = {err, v8::String::Empty(st.isolate), captured};
+    v8::Local<v8::Value> fields[] = {err, v8::String::Empty(st.isolate), record};
     v8::Context::Scope context_scope(st.safe_context);
     return v8::Array::New(st.isolate, fields, 3);
 }
@@ -1605,6 +1745,7 @@ void v8_call_impl(State *pst, const uint8_t *p, size_t n, bool await)
     bool preserve_termination = false;
     bool nested = st.javascript_call_depth > 0;
     JavascriptCallScope call_scope(st.javascript_call_depth);
+    if (!nested) st.captured.clear(); // left by microtasks run while idle
     if (await && nested) {
         throw_nested_await_call(st);
         cause = RUNTIME_ERROR;
@@ -1665,6 +1806,7 @@ void v8_call_impl(State *pst, const uint8_t *p, size_t n, bool await)
 fail:
     preserve_termination = suspend_termination(st, nested, cause);
     if (bubble_up_ruby_exception(st, &try_catch)) {
+        if (!nested) capture_after_eval(st);
         restore_termination(st, preserve_termination);
         return;
     }
@@ -1729,6 +1871,7 @@ void v8_eval_impl(State *pst, const uint8_t *p, size_t n, bool await)
     bool preserve_termination = false;
     bool nested = st.javascript_call_depth > 0;
     JavascriptCallScope call_scope(st.javascript_call_depth);
+    if (!nested) st.captured.clear(); // left by microtasks run while idle
     if (await && nested) {
         throw_nested_await_call(st);
         cause = RUNTIME_ERROR;
@@ -1761,6 +1904,7 @@ void v8_eval_impl(State *pst, const uint8_t *p, size_t n, bool await)
 fail:
     preserve_termination = suspend_termination(st, nested, cause);
     if (bubble_up_ruby_exception(st, &try_catch)) {
+        if (!nested) capture_after_eval(st);
         restore_termination(st, preserve_termination);
         return;
     }
@@ -2508,8 +2652,7 @@ State::~State()
         persistent_safe_context.Reset();
         persistent_context.Reset();
         ruby_exception.Reset();
-        captured.Reset();
-        captured_exception.Reset();
+        captured.clear();
     }
     isolate->Dispose();
     for (Callback *cb : callbacks)
