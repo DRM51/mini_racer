@@ -308,6 +308,79 @@ class MiniRacerCaptureTest < Minitest::Test
     assert_equal "f", capture["frames"].first["function"]
   end
 
+  def test_long_bind_chains_and_labels_are_bounded
+    ctx = new_context
+    ctx.eval(<<~JS)
+      var target = function named() {};
+      for (let i = 0; i < 20000; i++) target = target.bind(null);
+      function fail() { const f = target; const s = Symbol("x".repeat(10000)); throw new Error("x") }
+    JS
+    vars = variables(capture_of { ctx.call("fail") }["frames"].first)
+    assert_equal "[Function: bound bound bound bound \u2026]", vars["f"]
+    assert_operator vars["s"].length, :<, 600
+  end
+
+  def test_equal_thrown_primitives_get_the_newest_record
+    ctx = new_context
+    capture = capture_of { ctx.eval(<<~JS) }
+          (function unrelated() { let wrong = 1; Promise.reject("same") })();
+          (function real() { let right = 2; throw "same" })();
+        JS
+    assert_equal "real", capture["frames"].first["function"]
+  end
+
+  def test_thrown_bigints_are_captured
+    ctx = new_context
+    capture =
+      capture_of { ctx.eval("(function big() { let x = 1; throw 12n })()") }
+    assert_equal({ "x" => 1 }, variables(capture["frames"].first))
+  end
+
+  def test_nested_evaluations_leave_the_outer_record_alone
+    ctx = new_context
+    ctx.attach("nested", -> { ctx.eval("1") })
+    capture = capture_of { ctx.eval_await(<<~JS) }
+          const p = (async function real() { let a = 1; await null; throw new Error("real") })();
+          nested();
+          p
+        JS
+    assert_equal "real", capture["frames"].first["function"]
+
+    # a nested eval run by a getter while the result is converted keeps its own
+    inner = nil
+    ctx.attach(
+      "inner",
+      lambda do
+        inner =
+          capture_of { ctx.eval("(function deep() { let d = 1; null.x })()") }
+        1
+      end
+    )
+    assert_equal({ "x" => 1 }, ctx.eval("({ get x() { return inner() } })"))
+    assert_equal "deep", inner["frames"].first["function"]
+  end
+
+  def test_limits_hold_for_getters_dates_and_shared_objects
+    ctx = new_context
+    capture = capture_of { ctx.eval_await(<<~JS) }
+          var date = new Date(0);
+          const a0 = {}, a1 = { x: a0 }, a2 = { x: a1 }, a3 = { x: a2 }, a4 = { x: a3 };
+          const getters = Array.from({ length: 50 }, () =>
+            Array.from({ length: 50 }, () => {
+              const o = {};
+              for (let i = 0; i < 50; i++) Object.defineProperty(o, "g" + i, { enumerable: true, get() { return 1 } });
+              return o;
+            }));
+          const p = (async function real() { let when = date, chain = a4, g = getters; throw new Error("x") })();
+          date.setTime(123000);
+          p
+        JS
+    vars = variables(capture["frames"].first)
+    assert_equal Time.at(0), vars["when"]
+    assert_equal({ "x" => { "x" => { "x" => "[Object]" } } }, vars["chain"])
+    assert_equal true, capture["truncated"]
+  end
+
   def test_cannot_be_combined_with_the_inspector
     assert_raises(ArgumentError) do
       MiniRacer::Context.new(capture_on_throw: true, inspector: "x")

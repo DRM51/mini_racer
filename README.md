@@ -269,10 +269,13 @@ end
   (`"[Object]"`), at 50 properties or elements (`"… 20 more"`), and strings at
   500 characters. `Map`s become `[[key, value], ...]` and `Set`s arrays, unless
   they hold over 10,000 entries (`"[Map(20000)]"`). An object referenced from
-  several places is recorded once, so Ruby gets the same Hash each time.
-- Recording stops after 5,000 values or 100 ms, or when `timeout:` or
-  `Context#stop` ends the script. The capture then has `"truncated" => true`,
-  and the values it didn't reach show as `"[…]"`.
+  several places at the same depth is recorded once, so Ruby gets the same
+  Hash each time.
+- Recording stops after 5,000 values or 100 ms. The capture then has
+  `"truncated" => true`, and the values it didn't reach show as `"[…]"`. If
+  `timeout:` or `Context#stop` ends the script while it records, recording
+  stops too, and the error is a `MiniRacer::ScriptTerminatedError`, which has
+  no capture.
 - Some of the exception's own code does run. As with `verbose_exceptions: true`,
   V8 calls `toString` on a thrown object that isn't an `Error`. V8's debugger
   reads the exception's `name`, `message` and `stack`, so getters defined for
