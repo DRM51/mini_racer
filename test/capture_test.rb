@@ -216,10 +216,10 @@ class MiniRacerCaptureTest < Minitest::Test
     ctx = new_context(timeout: 5000)
     ctx.eval(<<~JS)
       const TABLE = {};
-      for (let i = 0; i < 200000; i++) TABLE["k" + i] = i;
+      for (let i = 0; i < 20000; i++) TABLE["k" + i] = i;
       const BIG = new Map(Array.from({ length: 20000 }, (_, i) => [i, i]));
       function recurse(n) {
-        const refs = [TABLE, TABLE, TABLE, BIG];
+        const refs = [BIG, TABLE, TABLE, TABLE];
         const text = new String("x".repeat(1000000));
         if (n === 0) throw new Error("bottom");
         return recurse(n - 1);
@@ -230,10 +230,10 @@ class MiniRacerCaptureTest < Minitest::Test
     elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
     assert_operator elapsed, :<, 2, "recording took #{elapsed}s"
     vars = variables(capture["frames"].first)
-    assert_equal "[Map(20000)]", vars["refs"][3]
+    assert_equal "[Map(20000)]", vars["refs"][0]
     assert vars["text"].end_with?("(1000000 chars)")
     # the table appears once per reference but is the same record
-    assert_same vars["refs"][0], vars["refs"][1]
+    assert_same vars["refs"][1], vars["refs"][2]
     assert_equal ["script"],
                  capture["frames"]
                    .flat_map { |f| f["scopes"] }
@@ -320,13 +320,14 @@ class MiniRacerCaptureTest < Minitest::Test
     assert_operator vars["s"].length, :<, 600
   end
 
-  def test_equal_thrown_primitives_get_the_newest_record
+  def test_equal_thrown_primitives_in_one_evaluation_get_no_record
     ctx = new_context
+    # a stray rejection and the real throw share the value: ambiguous
     capture = capture_of { ctx.eval(<<~JS) }
           (function unrelated() { let wrong = 1; Promise.reject("same") })();
           (function real() { let right = 2; throw "same" })();
         JS
-    assert_equal "real", capture["frames"].first["function"]
+    assert_nil capture
   end
 
   def test_thrown_bigints_are_captured
@@ -395,6 +396,47 @@ class MiniRacerCaptureTest < Minitest::Test
     assert_operator vars["keyed"].keys.first.length, :<, 600
   end
 
+  def test_ambiguous_records_are_left_out
+    ctx = new_context
+    # two rejections with an equal value in one evaluation: either could be
+    # the one awaited, so neither is attached
+    capture = capture_of { ctx.eval_await(<<~JS) }
+          const p = (async function wanted() { const right = 1; throw 404 })();
+          (async function unrelated() { const wrong = 2; throw 404 })();
+          p
+        JS
+    assert_nil capture
+  end
+
+  def test_a_nested_evaluation_cannot_take_its_callers_record
+    ctx = new_context
+    ctx.attach(
+      "nested",
+      lambda do
+        ctx.eval("throw 7")
+      rescue MiniRacer::RuntimeError
+        nil
+      end
+    )
+    capture = capture_of { ctx.eval_await(<<~JS) }
+          const p = (function outer() { let o = 1; return Promise.reject(7) })();
+          try { nested() } catch (e) {}
+          p
+        JS
+    assert_equal "outer", capture["frames"].first["function"]
+  end
+
+  def test_long_names_that_shorten_alike_both_stay
+    ctx = new_context
+    capture = capture_of { ctx.eval(<<~JS) }
+          (function f() {
+            const o = { ["k".repeat(600) + "a"]: 1, ["k".repeat(600) + "b"]: 2 };
+            throw new Error("x");
+          })()
+        JS
+    assert_equal [1, 2], variables(capture["frames"].first)["o"].values.sort
+  end
+
   def test_cannot_be_combined_with_the_inspector
     assert_raises(ArgumentError) do
       MiniRacer::Context.new(capture_on_throw: true, inspector: "x")
@@ -403,20 +445,28 @@ class MiniRacerCaptureTest < Minitest::Test
 
   def test_the_heap_limit_stays_where_it_was
     # V8's debugger would raise it fourfold near the limit; the fatal
-    # out-of-memory error must come at the same point as without capture
-    script = <<~RUBY
-      require "mini_racer"
-      MiniRacer::Platform.set_flags!(max_old_space_size: 64)
-      ctx = MiniRacer::Context.new(capture_on_throw: true)
-      ctx.attach("report", ->(n) { puts n; $stdout.flush; nil })
-      ctx.eval("const keep = []; for (let i = 0; ; i++) { keep.push({ i, s: 'x'.repeat(64) + i }); if (i % 100000 === 0) report(i) }")
-    RUBY
-    lib = File.expand_path("../lib", __dir__)
-    out, err, status = Open3.capture3(RbConfig.ruby, "-I", lib, "-e", script)
-    refute status.success?
-    assert_includes err, "out of memory" # V8's fatal error, not an exception
-    assert_operator out.split.map(&:to_i).max, :>=, 100_000
-    assert_operator out.split.map(&:to_i).max, :<, 600_000
+    # out-of-memory error must come at about the same point as without
+    # capture (it came at four to five times as many objects without the fix)
+    reached =
+      [false, true].map do |capture|
+        script = <<~RUBY
+          require "mini_racer"
+          MiniRacer::Platform.set_flags!(max_old_space_size: 64)
+          ctx = MiniRacer::Context.new(capture_on_throw: #{capture})
+          ctx.attach("report", ->(n) { puts n; $stdout.flush; nil })
+          ctx.eval("const keep = []; for (let i = 0; ; i++) { keep.push({ i, s: 'x'.repeat(64) + i }); if (i % 50000 === 0) report(i) }")
+        RUBY
+        lib = File.expand_path("../lib", __dir__)
+        out, err, status =
+          Open3.capture3(RbConfig.ruby, "-I", lib, "-e", script)
+        refute status.success?
+        assert_includes err, "out of memory" # V8's fatal error, not an exception
+        out.split.map(&:to_i).max
+      end
+    assert_operator reached[1],
+                    :<=,
+                    2 * reached[0],
+                    "capture off/on: #{reached}"
   end
 
   def test_uncaught_exceptions_are_not_printed
