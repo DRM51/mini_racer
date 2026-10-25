@@ -381,6 +381,20 @@ class MiniRacerCaptureTest < Minitest::Test
     assert_equal true, capture["truncated"]
   end
 
+  def test_values_ruby_cannot_take_and_long_names
+    ctx = new_context
+    capture = capture_of { ctx.eval(<<~JS) }
+          (function f() {
+            const bad = new Date(NaN);
+            const keyed = { ["k".repeat(5000)]: 1 };
+            throw new Error("x");
+          })()
+        JS
+    vars = variables(capture["frames"].first)
+    assert_equal "Invalid Date", vars["bad"]
+    assert_operator vars["keyed"].keys.first.length, :<, 600
+  end
+
   def test_cannot_be_combined_with_the_inspector
     assert_raises(ArgumentError) do
       MiniRacer::Context.new(capture_on_throw: true, inspector: "x")
