@@ -170,6 +170,7 @@ typedef struct Context
     Barrier early_init, late_init;
     // inspector (Chrome DevTools Protocol); see mini_racer_inspector.h
     int inspector;               // set by Context.new(inspector:)
+    int capture_on_throw;        // set by Context.new(capture_on_throw:)
     char inspector_title[256];
     int64_t max_pause;           // ms a breakpoint may hold the caller; 0 = no cap
     int inspector_pending;       // protected by |mtx|
@@ -1150,7 +1151,7 @@ static void *v8_thread_start(void *arg)
     barrier_wait(&c->early_init);
     v8_once_init();
     v8_thread_init(c, c->snapshot.buf, c->snapshot.len, c->max_memory, c->verbose_exceptions,
-                   c->inspector ? c->inspector_title : NULL);
+                   c->inspector ? c->inspector_title : NULL, c->capture_on_throw);
     while (c->quit < 2)
         pthread_cond_wait(&c->cv, &c->mtx);
     context_destroy(c);
@@ -1643,9 +1644,10 @@ static VALUE rendezvous(Context *c, Buf *req)
 static void raise_exception_with_message(VALUE klass, VALUE e)
 {
     long n;
-    VALUE message, stack = Qnil;
+    VALUE message, stack = Qnil, fields = rb_ary_new();
 
     if (RB_TYPE_P(e, T_ARRAY)) {
+        fields = e;
         stack = rb_ary_entry(e, 1);
         e = rb_ary_entry(e, 0);
     }
@@ -1659,7 +1661,11 @@ static void raise_exception_with_message(VALUE klass, VALUE e)
     if (!NIL_P(stack)) {
         if (klass == runtime_error) {
             VALUE args[] = {message, stack};
-            rb_exc_raise(rb_class_new_instance(2, args, klass));
+            VALUE exc = rb_class_new_instance(2, args, klass);
+            // Context.new(capture_on_throw:) sends [message, stack, capture]
+            if (RARRAY_LEN(fields) > 2)
+                rb_ivar_set(exc, rb_intern("@capture"), rb_ary_entry(fields, 2));
+            rb_exc_raise(exc);
         }
         // SnapshotError retains its existing combined message/stack format.
         if (RSTRING_LEN(stack)) {
@@ -2400,14 +2406,21 @@ static VALUE context_initialize(int argc, VALUE *argv, VALUE self)
                 rb_raise(rb_eArgError, "inspector is not supported in single_threaded mode");
             c->inspector = 1;
             set_inspector_title(c, v == Qtrue ? rb_str_new_cstr("mini_racer") : v);
+        } else if (!strcmp(s, "capture_on_throw")) {
+            c->capture_on_throw = !(v == Qfalse || v == Qnil);
+            if (c->capture_on_throw && single_threaded)
+                rb_raise(rb_eArgError, "capture_on_throw is not supported in single_threaded mode");
         } else {
             rb_raise(runtime_error, "bad keyword: %s", s);
         }
     }
+    // both would drive V8's one pause-on-exceptions setting
+    if (c->inspector && c->capture_on_throw)
+        rb_raise(rb_eArgError, "capture_on_throw can't be combined with inspector");
 init:
     if (single_threaded) {
         v8_once_init();
-        c->pst = v8_thread_init(c, c->snapshot.buf, c->snapshot.len, c->max_memory, c->verbose_exceptions, NULL);
+        c->pst = v8_thread_init(c, c->snapshot.buf, c->snapshot.len, c->max_memory, c->verbose_exceptions, NULL, 0);
     } else {
         cause = "pthread_attr_init";
         if ((r = pthread_attr_init(&attr)))
