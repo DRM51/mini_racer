@@ -188,6 +188,8 @@ Open `chrome://inspect` in Chrome; contexts appear under *Remote Target* (add
   on_worker_boot do |index|
     MiniRacer::Inspector.start(port: 9229 + 1 + index)
     Rails.logger.info "mini_racer inspector: #{MiniRacer::Inspector.url}"
+  rescue RuntimeError => e # port still held by an old worker, etc.
+    Rails.logger.warn "mini_racer inspector not started: #{e.message}"
   end
   ```
 
@@ -196,7 +198,20 @@ code in your process. Keep the default `127.0.0.1` host and reach a remote
 machine through an SSH tunnel (`ssh -L 9229:localhost:9229 server`);
 `Inspector.start` refuses other addresses unless given `allow_remote: true`.
 The server rejects HTTP requests whose `Host` header is not `localhost` or an
-IP address (DNS rebinding) and WebSocket connections from web page origins.
+IP address (DNS rebinding), WebSocket connections from web page origins, and
+anything but a strict WebSocket handshake (so an SSRF-able HTTP client can't
+smuggle protocol messages).
+
+Loopback is still shared with every other process on the machine (or pod).
+`Inspector.start(token: true)` puts a random token in front of every URL,
+`/json/list` included, so only someone given `Inspector.url` can find a
+context; `chrome://inspect` can't discover such targets, so open the
+`devtoolsFrontendUrl` from that list directly. Use a token anywhere other than
+your own machine.
+
+In production, prefer debugging outside the request path (a console or runner
+process replaying one job) over Puma workers, keep `max_pause:` short (say
+60–120 seconds) and always pass `wait_for_debugger` a `timeout:`.
 
 ### Fork Safety
 

@@ -31,8 +31,10 @@ void notify(Target& t);
 void send(Target& t, const std::string& utf8);
 
 // Returns the bound port, or -1 and sets *err. Starting again in the same
-// process returns the existing port.
-int start_server(const std::string& host, int port, std::string *err);
+// process returns the existing port. A non-empty |token| becomes the first
+// path segment of every URL the server answers, /json/list included.
+int start_server(const std::string& host, int port, const std::string& token,
+                 std::string *err);
 int server_port(); // -1 when not started in this process
 
 } // namespace mini_racer_inspector

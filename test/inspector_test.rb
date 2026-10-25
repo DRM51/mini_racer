@@ -458,4 +458,66 @@ class MiniRacerInspectorTest < Minitest::Test
     assert status.success?, "child saw parent state"
     assert_includes targets[1].map { |t| t["title"] }, "parent-only"
   end
+
+  def raw_request(head)
+    sock = TCPSocket.new("127.0.0.1", @port)
+    sock.write(head)
+    sock.gets.to_s
+  ensure
+    sock&.close
+  end
+
+  def upgrade_head(path, method: "GET", extra: "", version: "13")
+    "#{method} #{path} HTTP/1.1\r\nHost: 127.0.0.1:#{@port}\r\n" \
+      "Upgrade: websocket\r\nConnection: Upgrade\r\n" \
+      "Sec-WebSocket-Key: #{SecureRandom.base64(16)}\r\n" \
+      "Sec-WebSocket-Version: #{version}\r\n#{extra}\r\n"
+  end
+
+  def test_upgrade_requires_a_real_websocket_handshake
+    new_context(inspector: "strict")
+    path = URI(target_for("strict")["webSocketDebuggerUrl"]).path
+    assert_includes raw_request(upgrade_head(path, method: "POST")), " 400 "
+    assert_includes raw_request(upgrade_head(path, version: "8")), " 400 "
+    # an HTTP client smuggling frames after the request head
+    assert_includes raw_request(upgrade_head(path) + "\x81\x85abcdefghi"), " 400 "
+    assert_includes raw_request(upgrade_head(path)), " 101 "
+  end
+
+  def test_origin_matching_host_is_allowed
+    new_context(inspector: "same-origin")
+    client = connect("same-origin", headers: { "Origin" => "http://127.0.0.1:#{@port}" })
+    assert_equal 2, client.command("Runtime.evaluate", expression: "1 + 1")["result"]["value"]
+  end
+
+  def test_token_guards_every_url
+    script = <<~RUBY
+      require "mini_racer"
+      require "net/http"
+      require "json"
+      require "socket"
+      port = MiniRacer::Inspector.start(port: 0, token: "s3cret")
+      ctx = MiniRacer::Context.new(inspector: "tokened")
+      get = ->(path) { Net::HTTP.start("127.0.0.1", port) { |h| h.get(path) } }
+      checks = []
+      checks << (get.("/json/list").code == "404")
+      checks << (get.("/s3cretx/json/list").code == "404")
+      res = get.("/s3cret/json/list")
+      checks << (res.code == "200")
+      ws = JSON.parse(res.body).first["webSocketDebuggerUrl"]
+      checks << ws.start_with?("ws://127.0.0.1:\#{port}/s3cret/")
+      checks << (MiniRacer::Inspector.url == "http://127.0.0.1:\#{port}/s3cret/json/list")
+      sock = TCPSocket.new("127.0.0.1", port)
+      sock.write("GET \#{URI(ws).path} HTTP/1.1\\r\\nHost: 127.0.0.1:\#{port}\\r\\n" \\
+        "Upgrade: websocket\\r\\nConnection: Upgrade\\r\\n" \\
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\\r\\nSec-WebSocket-Version: 13\\r\\n\\r\\n")
+      checks << sock.gets.include?(" 101 ")
+      sock.close
+      ctx.dispose
+      exit(checks.all? ? 0 : 1)
+    RUBY
+    out = IO.popen([RbConfig.ruby, "-I", File.expand_path("../lib", __dir__),
+                    "-I", File.expand_path("../ext", __dir__), "-e", script], err: [:child, :out], &:read)
+    assert $?.success?, "token checks failed: #{out}"
+  end
 end

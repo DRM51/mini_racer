@@ -165,7 +165,13 @@ module MiniRacer
     #
     # Binding anything but a loopback address exposes code execution to the
     # network and needs allow_remote: true.
-    def self.start(host: "127.0.0.1", port: DEFAULT_PORT, allow_remote: false)
+    #
+    # token: true (or a string of letters, digits, - and _) makes the token
+    # the first path segment of every URL, /json/list included, so only
+    # someone told the URL can find or attach to a context. chrome://inspect
+    # can't discover such targets; open the devtoolsFrontendUrl from
+    # Inspector.url instead.
+    def self.start(host: "127.0.0.1", port: DEFAULT_PORT, allow_remote: false, token: nil)
       host = host.to_s
       if !allow_remote && !loopback?(host)
         raise ArgumentError,
@@ -173,7 +179,19 @@ module MiniRacer
                 "connect can run code in your contexts; bind 127.0.0.1 and " \
                 "tunnel, or pass allow_remote: true"
       end
-      __start(host, Integer(port))
+      if token == true
+        require "securerandom"
+        token = SecureRandom.hex(16)
+      end
+      token = token.to_s
+      unless token.match?(/\A[A-Za-z0-9_-]*\z/)
+        raise ArgumentError, "token may only contain letters, digits, - and _"
+      end
+      return self.port if started? # the method, not the port: keyword
+      bound = __start(host, Integer(port), token)
+      @host = host
+      @token = token.empty? ? nil : token
+      bound
     end
 
     def self.loopback?(host)
@@ -185,10 +203,15 @@ module MiniRacer
     end
     private_class_method :loopback?
 
-    # The target discovery URL, handy for logging which port a process got.
+    # The target discovery URL, token included, for logging which port (and
+    # token) a process got. nil until started.
     def self.url
-      p = port
-      p && "http://127.0.0.1:#{p}/json/list"
+      p = port or return nil
+      h = @host.to_s.delete_prefix("[").delete_suffix("]")
+      h = "127.0.0.1" if h.empty? || h == "0.0.0.0"
+      h = "::1" if h == "::"
+      h = "[#{h}]" if h.include?(":")
+      "http://#{h}:#{p}#{"/#{@token}" if @token}/json/list"
     end
 
     def self.started?

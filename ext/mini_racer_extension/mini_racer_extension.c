@@ -1905,16 +1905,18 @@ static VALUE context_inspector_break_next(VALUE self)
     return Qnil;
 }
 
-static VALUE inspector_start(VALUE self, VALUE host, VALUE port)
+static VALUE inspector_start(VALUE self, VALUE host, VALUE port, VALUE token)
 {
     char err[256];
     int r;
 
     StringValue(host);
+    StringValue(token);
     Check_Type(port, T_FIXNUM);
     if (FIX2LONG(port) < 0 || FIX2LONG(port) > 65535)
         rb_raise(rb_eArgError, "bad port");
-    r = v8_inspector_start(StringValueCStr(host), (int)FIX2LONG(port), err, sizeof(err));
+    r = v8_inspector_start(StringValueCStr(host), (int)FIX2LONG(port),
+                           StringValueCStr(token), err, sizeof(err));
     if (r < 0)
         rb_raise(runtime_error, "inspector: %s", err);
     return INT2FIX(r);
@@ -2499,7 +2501,7 @@ void Init_mini_racer_extension(void)
     rb_define_alloc_func(c, snapshot_alloc);
 
     c = rb_define_module_under(m, "Inspector");
-    rb_define_private_method(rb_singleton_class(c), "__start", inspector_start, 2);
+    rb_define_private_method(rb_singleton_class(c), "__start", inspector_start, 3);
     rb_define_singleton_method(c, "port", inspector_port, 0);
 
     c = rb_define_class_under(m, "Platform", rb_cObject);

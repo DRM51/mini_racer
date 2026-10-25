@@ -75,7 +75,7 @@ void v8_inspector_dispatch(struct State *pst); // v8 thread, while idle
 void v8_inspector_shutdown(struct State *pst); // v8 thread, without Context.mtx
 int v8_inspector_status(struct State *pst);
 void v8_inspector_break_next(struct State *pst);
-int v8_inspector_start(const char *host, int port, char *err, size_t errlen);
+int v8_inspector_start(const char *host, int port, const char *token, char *err, size_t errlen);
 int v8_inspector_port(void);
 
 #ifdef __cplusplus

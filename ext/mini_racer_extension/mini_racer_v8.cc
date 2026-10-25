@@ -1928,10 +1928,11 @@ extern "C" void v8_inspector_break_next(State *pst)
         in->break_next = true;
 }
 
-extern "C" int v8_inspector_start(const char *host, int port, char *err, size_t errlen)
+extern "C" int v8_inspector_start(const char *host, int port, const char *token,
+                                  char *err, size_t errlen)
 {
     std::string e;
-    int r = mri::start_server(host, port, &e);
+    int r = mri::start_server(host, port, token, &e);
     if (r < 0)
         snprintf(err, errlen, "%s", e.c_str());
     return r;

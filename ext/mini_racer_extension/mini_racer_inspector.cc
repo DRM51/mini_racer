@@ -31,10 +31,12 @@ namespace {
 constexpr uint64_t kMaxMessage = 16u << 20;
 constexpr size_t kMaxHttpRequest = 64u << 10;
 constexpr size_t kMaxConns = 32;
-// A frontend that stops reading must not stall the V8 thread (which sends
-// protocol messages synchronously) or the server thread for long; a send
-// that makes no progress for this long drops the connection.
-constexpr int kSendTimeoutSec = 10;
+// A frontend that stops or slows down reading must not stall the V8 thread
+// (which sends protocol messages synchronously) or the server thread for
+// long: a message that makes no progress for kSendIdleMs, or takes longer
+// than kSendTotalMs in all, drops the connection.
+constexpr int kSendIdleMs = 10 * 1000;
+constexpr int kSendTotalMs = 30 * 1000;
 
 struct Conn
 {
@@ -71,6 +73,7 @@ std::map<std::string, std::shared_ptr<Target>> *g_targets =
     new std::map<std::string, std::shared_ptr<Target>>;
 std::vector<int> g_conn_fds; // open frontend sockets, closed in fork children
 std::string g_host;
+std::string g_prefix; // "/<token>" when started with a token, else empty
 int g_port = -1;
 int g_lfd = -1;
 
@@ -91,6 +94,7 @@ void atfork_child()
         close(g_lfd);
     g_lfd = -1;
     g_port = -1;
+    g_prefix.clear();
     g_mu.unlock();
 }
 
@@ -102,11 +106,14 @@ void install_atfork()
     });
 }
 
-void set_cloexec(int fd)
+void set_cloexec_nonblock(int fd)
 {
     int flags = fcntl(fd, F_GETFD);
     if (flags >= 0)
         fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+    flags = fcntl(fd, F_GETFL);
+    if (flags >= 0)
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 // --- SHA-1 and base64, for the WebSocket handshake only ---
@@ -233,7 +240,7 @@ void push(Target& t, Event ev, std::string msg)
 
 // --- sockets ---
 
-// Caller holds c.wmu.
+// Caller holds c.wmu. Sockets are non-blocking; see kSendIdleMs.
 bool write_all(Conn& c, const char *p, size_t n)
 {
 #ifdef MSG_NOSIGNAL
@@ -241,14 +248,25 @@ bool write_all(Conn& c, const char *p, size_t n)
 #else
     const int flags = 0; // SO_NOSIGPIPE is set on accept
 #endif
+    using clock = std::chrono::steady_clock;
+    const auto deadline = clock::now() + std::chrono::milliseconds(kSendTotalMs);
     while (n > 0) {
         ssize_t r = ::send(c.fd, p, n, flags);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return false;
+        if (r >= 0) {
+            p += r;
+            n -= static_cast<size_t>(r);
+            continue;
         }
-        p += r;
-        n -= static_cast<size_t>(r);
+        if (errno == EINTR)
+            continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return false;
+        auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - clock::now()).count();
+        if (left <= 0)
+            return false;
+        pollfd pfd{c.fd, POLLOUT, 0};
+        if (::poll(&pfd, 1, static_cast<int>(left < kSendIdleMs ? left : kSendIdleMs)) == 0)
+            return false;
     }
     return true;
 }
@@ -335,10 +353,12 @@ bool host_allowed(const std::string& host)
 
 // Cross-site WebSocket guard: browsers send Origin on WebSocket upgrades and
 // a page can open ws://127.0.0.1 directly. DevTools frontends either send a
-// devtools:// or chrome:// origin or, like VS Code and other tools, none.
-bool origin_allowed(const std::string& origin)
+// devtools:// or chrome:// origin or, like VS Code, none; some client
+// libraries send http://<the Host header>, which no web page can have since
+// this server serves no pages.
+bool origin_allowed(const std::string& origin, const std::string& host)
 {
-    if (origin.empty())
+    if (origin.empty() || (!host.empty() && lower(origin) == "http://" + lower(host)))
         return true;
     static const char *const ok[] = {"devtools://", "chrome://", "chrome-devtools://"};
     std::string o = lower(origin);
@@ -366,7 +386,7 @@ std::string target_list(const std::string& hostport)
     bool first = true;
     for (auto& kv : *g_targets) {
         const Target& t = *kv.second;
-        std::string ws = hostport + "/" + t.id;
+        std::string ws = hostport + g_prefix + "/" + t.id;
         if (!first) out += ",";
         first = false;
         out += "{\"description\":\"mini_racer context\",";
@@ -419,14 +439,38 @@ bool handle_http(const std::shared_ptr<Conn>& c)
         send_raw(*c, http_response("403 Forbidden", "{\"error\":\"Host header must be localhost or an IP address\"}"));
         return false;
     }
-    std::string hostport = host;
-    if (hostport.empty()) {
+    std::string hostport = host, prefix;
+    {
         std::lock_guard<std::mutex> lock(g_mu);
-        hostport = g_host + ":" + std::to_string(g_port);
+        if (hostport.empty())
+            hostport = g_host + ":" + std::to_string(g_port);
+        prefix = g_prefix;
+    }
+    // with a token every URL starts with it, discovery included; compare
+    // all of it so timing doesn't leak a prefix
+    if (!prefix.empty()) {
+        bool match = path.size() > prefix.size() && path[prefix.size()] == '/';
+        unsigned char diff = 0;
+        for (size_t i = 0; i < prefix.size(); i++)
+            diff |= static_cast<unsigned char>(prefix[i] ^ (i < path.size() ? path[i] : 0));
+        if (!match || diff) {
+            send_raw(*c, http_response("404 Not Found", "{}"));
+            return false;
+        }
+        path.erase(0, prefix.size());
     }
 
     if (lower(headers["upgrade"]) == "websocket") {
-        if (!origin_allowed(headers["origin"])) {
+        // a strict handshake, so that only a WebSocket client can get here:
+        // a plain HTTP client tricked into sending an Upgrade header (SSRF)
+        // can't also produce frames, and pipelined bytes are refused
+        if (method != "GET" || lower(headers["connection"]).find("upgrade") == std::string::npos ||
+            headers["sec-websocket-version"] != "13" || headers["sec-websocket-key"].size() != 24 ||
+            !c->in.empty()) {
+            send_raw(*c, http_response("400 Bad Request", "{\"error\":\"bad WebSocket handshake\"}"));
+            return false;
+        }
+        if (!origin_allowed(headers["origin"], host)) {
             send_raw(*c, http_response("403 Forbidden", "{\"error\":\"WebSocket connections from web pages are not allowed\"}"));
             return false;
         }
@@ -583,18 +627,16 @@ void *server_main(void *arg)
         conns.swap(keep);
         if (pfds[0].revents & POLLIN) {
             std::lock_guard<std::mutex> lock(g_mu); // see close_conn
-            int fd = accept(lfd, nullptr, nullptr);
+            int fd = accept(lfd, nullptr, nullptr); // non-blocking
             if (fd >= 0 && conns.size() >= kMaxConns) {
                 close(fd);
             } else if (fd >= 0) {
-                set_cloexec(fd);
+                set_cloexec_nonblock(fd);
                 int one = 1;
 #ifdef SO_NOSIGPIPE
                 setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
                 setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-                timeval tv{kSendTimeoutSec, 0};
-                setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
                 g_conn_fds.push_back(fd);
                 conns.push_back(std::make_shared<Conn>(fd));
             }
@@ -677,7 +719,8 @@ void send(Target& t, const std::string& utf8)
         send_frame(*conn, 0x1, utf8);
 }
 
-int start_server(const std::string& host, int port, std::string *err)
+int start_server(const std::string& host, int port, const std::string& token,
+                 std::string *err)
 {
     install_atfork();
     std::lock_guard<std::mutex> lock(g_mu);
@@ -698,7 +741,7 @@ int start_server(const std::string& host, int port, std::string *err)
     for (addrinfo *ai = res; ai; ai = ai->ai_next) {
         lfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (lfd < 0) { last = strerror(errno); continue; }
-        set_cloexec(lfd);
+        set_cloexec_nonblock(lfd);
         int one = 1;
         setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         if (bind(lfd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(lfd, 16) == 0)
@@ -732,6 +775,7 @@ int start_server(const std::string& host, int port, std::string *err)
     g_lfd = lfd;
     g_host = host.find(':') != std::string::npos ? "[" + host + "]" : host;
     g_port = bound;
+    g_prefix = token.empty() ? std::string() : "/" + token;
     return bound;
 }
 
