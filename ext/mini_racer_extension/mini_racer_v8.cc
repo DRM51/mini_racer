@@ -877,7 +877,9 @@ struct CaptureClient final : public v8_inspector::V8InspectorClient
     void runMessageLoopOnPause(int) override;
     double currentTimeMS() override { return platform->CurrentClockTimeMillis(); }
     v8::Local<v8::Context> ensureDefaultContextInGroup(int) override;
-    void consoleAPIMessage(int, int, v8::Isolate::MessageErrorLevel,
+    // the overload without a context id: V8 13 has only this one, and V8
+    // 14's other overload calls it
+    void consoleAPIMessage(int, v8::Isolate::MessageErrorLevel,
                            const v8_inspector::StringView&,
                            const v8_inspector::StringView&, unsigned, unsigned,
                            v8_inspector::V8StackTrace*) override;
@@ -933,7 +935,7 @@ v8::Local<v8::Context> CaptureClient::ensureDefaultContextInGroup(int)
     return cap.st.context;
 }
 
-void CaptureClient::consoleAPIMessage(int, int, v8::Isolate::MessageErrorLevel,
+void CaptureClient::consoleAPIMessage(int, v8::Isolate::MessageErrorLevel,
                                       const v8_inspector::StringView&,
                                       const v8_inspector::StringView&, unsigned,
                                       unsigned, v8_inspector::V8StackTrace*)
