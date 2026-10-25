@@ -284,12 +284,15 @@ end
   one thrown inside a `try` in an outer script, around the Ruby callback that
   made the nested `eval`, isn't recorded. The `script` scope (top-level
   `let`/`const`) is listed once, in the first frame that has it.
-- Costs. Synchronous code that doesn't throw runs at the same speed. The
-  enabled debugger slows down asynchronous code and makes throwing more
-  expensive:
+- Costs. Synchronous code that doesn't throw runs at the same speed once
+  compiled. The enabled debugger slows down compiling, asynchronous code and
+  throwing:
   - each `await`: about 0.6 µs more (a tight `async` loop runs about 8×
     slower); promise chains about 0.1 µs per step;
-  - each `eval` (each script compiled): about 15 µs more;
+  - compiling: V8 turns its compilation cache off while a debugger is
+    enabled, so each `eval` compiles its source again (about 15 µs plus
+    13 µs per KB of source more than a cached compile), and `new Function`
+    or `eval` called in a loop runs up to about 60× slower;
   - each `throw` caught in JavaScript: about 0.5 µs more;
   - each recorded exception: typically 0.2 ms, at most about 100 ms of
     recording. That includes a promise rejected while nothing handles it yet,
@@ -305,9 +308,18 @@ end
   This makes capture mode a good fit for re-running a failed script, and
   for editor and test runs. Measure it before turning it on for all
   production traffic.
-- V8 caches a stack frame for each `console.*` call site in each script. A
-  long-lived context that evaluates many different scripts that call `console`
-  grows by about 180 bytes per such script until it is disposed.
+- `console.*` methods V8 provides itself, which do nothing without a debugger,
+  now keep their arguments alive until the `eval` or `call` returns, and V8
+  caches a stack frame for each call site in each script: a long-lived
+  context that evaluates many different scripts that call `console` grows by
+  about 180 bytes per such script until it is disposed. Attach your own
+  `console` to avoid both.
+- Recording takes time and memory at the moment of failure: near `timeout:` or
+  `max_memory:` it can be what crosses the limit, so the error becomes a
+  `ScriptTerminatedError` or `V8OutOfMemoryError` without a capture.
+- V8's debugger would raise the heap limit fourfold when it's reached;
+  capture mode keeps it where it was, so a context runs out of memory at the
+  same point as without the option.
 - Can't be combined with `inspector:`, and is not available in
   `:single_threaded` mode or on TruffleRuby.
 
