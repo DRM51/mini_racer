@@ -65,6 +65,7 @@ module MiniRacer
     #    "scopes" => [{"type" => "local", "variables" => {"x" => 1}}]}]}
     # Values are copies, cut off at a few levels deep and a few hundred
     # characters; getters and proxies show as "[Getter]" and "[Proxy]".
+    # "truncated" => true when recording ran out of room or time.
     attr_reader :capture
 
     def initialize(message, stack = "")

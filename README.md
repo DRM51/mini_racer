@@ -262,15 +262,32 @@ end
   the backtrace. Each frame's scopes are listed innermost first (`block`,
   `local`, `closure`, `script` for top-level `let`/`const`, ...), never
   `globalThis`.
-- Values are copies, taken without running any JavaScript: getters show as
-  `"[Getter]"`, proxies as `"[Proxy]"`, functions as `"[Function: name]"`,
-  errors as `"TypeError: message"`. Objects are cut off three levels below a
-  variable (`"[Object]"`), at 50 properties or elements (`"… 20 more"`) and
-  strings at 500 characters; `Map`s become `[[key, value], ...]` and `Set`s
-  arrays.
-- The capture costs about 0.2 ms per failing call. Code that doesn't throw
-  runs at the same speed, but each `eval` (each script compiled) costs about
-  15 µs more, and each `throw` caught in JavaScript about 0.5 µs more.
+- Values are copies, made without calling getters, proxy traps or methods:
+  getters show as `"[Getter]"`, proxies as `"[Proxy]"`, functions as
+  `"[Function: name]"`, errors as `"TypeError: message"`, regular expressions
+  as `"/source/flags"`. Objects are cut off three levels below a variable
+  (`"[Object]"`), at 50 properties or elements (`"… 20 more"`), and strings at
+  500 characters. `Map`s become `[[key, value], ...]` and `Set`s arrays, unless
+  they hold over 10,000 entries (`"[Map(20000)]"`). An object referenced from
+  several places is recorded once, so Ruby gets the same Hash each time.
+- Recording stops after 5,000 values or 100 ms, or when `timeout:` or
+  `Context#stop` ends the script. The capture then has `"truncated" => true`,
+  and the values it didn't reach show as `"[…]"`.
+- Some of the exception's own code does run. As with `verbose_exceptions: true`,
+  V8 calls `toString` on a thrown object that isn't an `Error`. V8's debugger
+  reads the exception's `name`, `message` and `stack`, so getters defined for
+  those run once more than without the option.
+- Code that doesn't throw runs at the same speed. Costs:
+  - each captured failure: about 0.2 ms;
+  - each `eval` (each script compiled): about 15 µs more;
+  - each `throw` caught in JavaScript: about 0.5 µs more;
+  - a throw thousands of frames deep: tens of milliseconds, because V8
+    describes every frame;
+  - an object with a million properties: about half a second, because V8
+    lists them all before 50 are kept.
+- V8 caches a stack frame for each `console.*` call site in each script. A
+  long-lived context that evaluates many different scripts that call `console`
+  grows by about 180 bytes per such script until it is disposed.
 - Can't be combined with `inspector:`, and is not available in
   `:single_threaded` mode or on TruffleRuby.
 
