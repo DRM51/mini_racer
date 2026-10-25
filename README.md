@@ -258,8 +258,12 @@ end
   waiting on (`"reason" => "promiseRejection"`). Exceptions caught in
   JavaScript are not recorded. A Ruby exception raised by an attached function
   propagates unchanged, without a capture.
-- Up to 8 recorded exceptions wait for the error they belong to; a ninth (a
-  ninth unhandled rejection, say) pushes out the oldest.
+- Matching a record to its error is best effort. A record made during an
+  `eval` or `call` only attaches to that evaluation's own error, and only if
+  it's the only one of that evaluation's records with the same thrown value:
+  two rejections with an equal value (two `404`s, say) get no capture, rather
+  than possibly the wrong one. Up to 8 records wait for their error; a ninth
+  (a ninth unhandled rejection, say) pushes out the oldest.
 - Up to 10 frames, innermost first; `line` and `column` count from 1 and match
   the backtrace. Each frame's scopes are listed innermost first (`block`,
   `local`, `closure`, `script` for top-level `let`/`const`, ...), never
@@ -268,13 +272,16 @@ end
   getters show as `"[Getter]"`, proxies as `"[Proxy]"`, functions as
   `"[Function: name]"`, errors as `"TypeError: message"`, regular expressions
   as `"/source/flags"`. Objects are cut off three levels below a variable
-  (`"[Object]"`), at 50 properties or elements (`"… 20 more"`), and strings at
-  500 characters. `Map`s become `[[key, value], ...]` and `Set`s arrays, unless
+  (`"[Object]"`), at 50 properties or elements (`"… 20 more"`), and strings,
+  names and labels at 500 characters (UTF-16 code units), followed by their
+  length. `Map`s become `[[key, value], ...]` and `Set`s arrays, unless
   they hold over 10,000 entries (`"[Map(20000)]"`). An object referenced from
   several places at the same depth is recorded once, so Ruby gets the same
   Hash each time.
-- Recording stops after 5,000 values or 100 ms. The capture then has
-  `"truncated" => true`, and the values it didn't reach show as `"[…]"`. If
+- Recording stops after 5,000 values or 100 ms; the deadline is checked
+  between values, so one large value can carry it somewhat past. The capture
+  then has `"truncated" => true`; values it didn't reach show as `"[…]"`, and
+  scopes it didn't reach have empty `"variables"`. If
   `timeout:` or `Context#stop` ends the script while it records, recording
   stops too, and the error is a `MiniRacer::ScriptTerminatedError`, which has
   no capture.
