@@ -1,5 +1,10 @@
-- Unreleased
-  - Add remote debugging with Chrome DevTools: MiniRacer::Inspector.start, Context.new(inspector:), Context#wait_for_debugger and #debugger_attached?, Context.new(max_pause:), Inspector.start(token:, allow_remote:)
+- 0.22.2.1 - 25-10-2026
+  - DRM51 build: upstream 0.22.2 and its unreleased fixes, plus the changes below. The fourth version segment numbers our builds; upstream does not use it
+  - Add remote debugging with Chrome DevTools: `MiniRacer::Inspector.start(port:, host:, token:, allow_remote:)`, `Context.new(inspector:, max_pause:)`, `Context#wait_for_debugger`, `Context#debugger_attached?`, `Inspector.url`
+  - Time spent paused at a breakpoint does not count against `timeout:`; `max_pause:` (default 10 minutes) ends a pause, or a debugger expression run during one, that goes on too long
+  - The inspector server binds to loopback unless `allow_remote: true`, checks Host and Origin headers, requires a strict WebSocket handshake, and bounds connections, message sizes, queued messages and idle handshakes
+  - Return JavaScript objects to Ruby about twice as fast: strings are converted in C instead of through `String#encode!`, and repeated object keys share one frozen string
+  - Stop assigning a permanent `object_id` to every Hash and Array passed to JavaScript
   - Preserve multiline JavaScript runtime error messages separately from backtraces (#262)
   - Convert Ruby Date values, including nested values and callback results, to JavaScript Date using to_time (#136)
   - Discard Context#load's completion value to avoid invoking getters during result conversion; load now returns nil (#197)
