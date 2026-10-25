@@ -975,6 +975,15 @@ void capture_after_eval(State& st)
     }
 }
 
+// V8's debugger raises the heap limit fourfold when it's nearly reached,
+// so a frontend could still inspect the out-of-memory state. Capture mode
+// has no frontend: keep the limit, so the context fails where it would have.
+// V8 only calls the callback added last.
+size_t capture_near_heap_limit(void *, size_t current_heap_limit, size_t)
+{
+    return current_heap_limit;
+}
+
 void capture_init(State& st)
 {
     st.capture = std::make_unique<Capture>(st);
@@ -989,6 +998,7 @@ void capture_init(State& st)
     // scripts are only looked up while paused; keep none after they're collected
     capture_dispatch(cap, "{\"id\":1,\"method\":\"Debugger.enable\",\"params\":{\"maxScriptsCacheSize\":0}}");
     capture_dispatch(cap, "{\"id\":2,\"method\":\"Debugger.setPauseOnExceptions\",\"params\":{\"state\":\"uncaught\"}}");
+    st.isolate->AddNearHeapLimitCallback(capture_near_heap_limit, nullptr);
     // debugger; statements would pause too, for nothing
     capture_dispatch(cap, "{\"id\":4,\"method\":\"Debugger.setBreakpointsActive\",\"params\":{\"active\":false}}");
 }

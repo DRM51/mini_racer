@@ -401,6 +401,22 @@ class MiniRacerCaptureTest < Minitest::Test
     end
   end
 
+  def test_the_heap_limit_stays_where_it_was
+    # V8's debugger would raise it fourfold near the limit; the fatal
+    # out-of-memory error must come at the same point as without capture
+    script = <<~RUBY
+      require "mini_racer"
+      MiniRacer::Platform.set_flags!(max_old_space_size: 64)
+      ctx = MiniRacer::Context.new(capture_on_throw: true)
+      ctx.attach("report", ->(n) { puts n; $stdout.flush })
+      ctx.eval("const keep = []; for (let i = 0; ; i++) { keep.push({ i, s: 'x'.repeat(64) + i }); if (i % 100000 === 0) report(i) }")
+    RUBY
+    lib = File.expand_path("../lib", __dir__)
+    out, _, status = Open3.capture3(RbConfig.ruby, "-I", lib, "-e", script)
+    refute status.success?
+    assert_operator out.split.map(&:to_i).max, :<, 500_000
+  end
+
   def test_uncaught_exceptions_are_not_printed
     script = <<~RUBY
       require "mini_racer"
