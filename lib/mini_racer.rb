@@ -118,5 +118,81 @@ module MiniRacer
     ensure
       f.close if implicit
     end
+
+    # True while a DevTools frontend is connected to this context.
+    # Requires Context.new(inspector: ...).
+    def debugger_attached?
+      __inspector_status & INSPECTOR_ATTACHED != 0
+    end
+
+    # Blocks until a DevTools frontend has attached and is ready, then pauses
+    # on the first statement of the next eval or call so breakpoints can be
+    # set before any code runs. Returns false if |timeout| (seconds) passes
+    # first, true otherwise.
+    def wait_for_debugger(timeout: nil)
+      if __inspector_status & INSPECTOR_ENABLED == 0
+        raise ArgumentError, "context was not created with inspector:"
+      end
+      deadline =
+        timeout && Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      until __inspector_status & INSPECTOR_READY != 0
+        if deadline && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+          return false
+        end
+        sleep 0.05
+      end
+      __inspector_break_next
+      true
+    end
+
+    INSPECTOR_ENABLED = 1
+    INSPECTOR_ATTACHED = 2
+    INSPECTOR_READY = 4
+    private_constant :INSPECTOR_ENABLED, :INSPECTOR_ATTACHED, :INSPECTOR_READY
+  end
+
+  # Chrome DevTools Protocol server, one per process. Contexts created with
+  # inspector: true (or inspector: "name") show up as targets under
+  # chrome://inspect once it is started. Anyone who can reach the port can
+  # run arbitrary code in those contexts: keep the default loopback host and
+  # tunnel (e.g. ssh -L 9229:localhost:9229) to debug a remote machine.
+  module Inspector
+    DEFAULT_PORT = 9229
+
+    # Starts the server and returns the bound port (pass port: 0 for any
+    # free port). Calling it again in the same process returns that port;
+    # a forked child starts afresh, without the parent's contexts.
+    #
+    # Binding anything but a loopback address exposes code execution to the
+    # network and needs allow_remote: true.
+    def self.start(host: "127.0.0.1", port: DEFAULT_PORT, allow_remote: false)
+      host = host.to_s
+      if !allow_remote && !loopback?(host)
+        raise ArgumentError,
+              "refusing to expose the inspector on #{host}: anyone who can " \
+                "connect can run code in your contexts; bind 127.0.0.1 and " \
+                "tunnel, or pass allow_remote: true"
+      end
+      __start(host, Integer(port))
+    end
+
+    def self.loopback?(host)
+      return true if host == "localhost"
+      require "ipaddr"
+      IPAddr.new(host.delete_prefix("[").delete_suffix("]")).loopback?
+    rescue IPAddr::InvalidAddressError
+      false
+    end
+    private_class_method :loopback?
+
+    # The target discovery URL, handy for logging which port a process got.
+    def self.url
+      p = port
+      p && "http://127.0.0.1:#{p}/json/list"
+    end
+
+    def self.started?
+      !port.nil?
+    end
   end
 end

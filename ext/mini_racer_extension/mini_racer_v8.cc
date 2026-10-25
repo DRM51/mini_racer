@@ -1,9 +1,13 @@
 #include "v8.h"
 #include "v8-profiler.h"
+#include "v8-inspector.h"
 #include "libplatform/libplatform.h"
 #include "mini_racer_v8.h"
+#include "mini_racer_inspector.h"
 #include <atomic>
+#include <chrono>
 #include <memory>
+#include <string>
 #include <vector>
 #include <cassert>
 #include <cstdarg>
@@ -81,6 +85,8 @@ enum : unsigned
 // API rb_thread_lock_native_thread() that pins the thread but I don't
 // think we're quite ready yet to drop support for older versions, hence
 // this inelegant "everything" struct.
+struct Inspector; // defined below, only exists when Context.new(inspector:)
+
 struct State
 {
     v8::Isolate *isolate;
@@ -109,6 +115,10 @@ struct State
     bool verbose_exceptions;
     std::vector<Callback*> callbacks;
     std::unique_ptr<v8::ArrayBuffer::Allocator> allocator;
+    std::unique_ptr<Inspector> inspector;
+    // true while the inspector runs frontend messages with no ruby call in
+    // progress; js -> ruby callbacks have nobody to answer them then
+    bool inspector_idle;
     inline ~State();
 };
 
@@ -476,9 +486,345 @@ void v8_gc_callback(v8::Isolate*, v8::GCType, v8::GCCallbackFlags, void *data)
     }
 }
 
+} // namespace anonymous
+
+// --- Chrome DevTools Protocol support ---
+//
+// All of this runs on the v8 thread except inspector_wake (server thread)
+// and the Ruby-facing status accessors, which only touch atomics. Frontend
+// messages arrive in three situations, mirroring Node:
+//   - idle: v8_thread_main sees inspector_pending and calls
+//     v8_inspector_dispatch
+//   - running JS: an isolate interrupt drains them
+//   - paused at a breakpoint: runMessageLoopOnPause drains them until resumed
+
+namespace mri = mini_racer_inspector;
+
+namespace {
+
+constexpr int kContextGroupId = 1;
+
+void request_termination(State *pst, unsigned request);
+
+std::vector<uint16_t> utf8_to_utf16(const std::string& s)
+{
+    std::vector<uint16_t> out;
+    out.reserve(s.size());
+    const unsigned char *p = reinterpret_cast<const unsigned char *>(s.data());
+    const unsigned char *pe = p + s.size();
+    while (p < pe) {
+        uint32_t c = *p++;
+        int extra = 0;
+        if (c >= 0xF0 && c < 0xF8)      { c &= 0x07; extra = 3; }
+        else if (c >= 0xE0)             { c &= 0x0F; extra = 2; }
+        else if (c >= 0xC0)             { c &= 0x1F; extra = 1; }
+        else if (c >= 0x80)             { out.push_back(0xFFFD); continue; }
+        if (c >= 0xF8 || pe - p < extra) { out.push_back(0xFFFD); break; }
+        bool ok = true;
+        for (int i = 0; i < extra; i++) {
+            if ((p[i] & 0xC0) != 0x80) { ok = false; break; }
+            c = (c << 6) | (p[i] & 0x3F);
+        }
+        if (!ok) { out.push_back(0xFFFD); continue; }
+        p += extra;
+        if (c >= 0x10000) {
+            c -= 0x10000;
+            out.push_back(static_cast<uint16_t>(0xD800 + (c >> 10)));
+            out.push_back(static_cast<uint16_t>(0xDC00 + (c & 0x3FF)));
+        } else {
+            out.push_back(static_cast<uint16_t>(c));
+        }
+    }
+    return out;
+}
+
+void put_utf8(std::string& out, uint32_t c)
+{
+    if (c < 0x80) {
+        out += static_cast<char>(c);
+    } else if (c < 0x800) {
+        out += static_cast<char>(0xC0 | (c >> 6));
+        out += static_cast<char>(0x80 | (c & 0x3F));
+    } else if (c < 0x10000) {
+        out += static_cast<char>(0xE0 | (c >> 12));
+        out += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (c & 0x3F));
+    } else {
+        out += static_cast<char>(0xF0 | (c >> 18));
+        out += static_cast<char>(0x80 | ((c >> 12) & 0x3F));
+        out += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (c & 0x3F));
+    }
+}
+
+std::string to_utf8(const v8_inspector::StringView& v)
+{
+    std::string out;
+    if (v.is8Bit()) { // latin1
+        for (size_t i = 0; i < v.length(); i++)
+            put_utf8(out, v.characters8()[i]);
+        return out;
+    }
+    const uint16_t *p = v.characters16();
+    for (size_t i = 0, n = v.length(); i < n; i++) {
+        uint32_t c = p[i];
+        if (c >= 0xD800 && c < 0xDC00 && i+1 < n && p[i+1] >= 0xDC00 && p[i+1] < 0xE000) {
+            c = 0x10000 + ((c - 0xD800) << 10) + (p[++i] - 0xDC00);
+        } else if (c >= 0xD800 && c < 0xE000) {
+            c = 0xFFFD; // lone surrogate
+        }
+        put_utf8(out, c);
+    }
+    return out;
+}
+
+v8_inspector::StringView latin1_view(const char *s)
+{
+    return v8_inspector::StringView(reinterpret_cast<const uint8_t *>(s), strlen(s));
+}
+
+struct InspectorClient final : public v8_inspector::V8InspectorClient
+{
+    Inspector& in;
+    explicit InspectorClient(Inspector& in) : in(in) {}
+    void runMessageLoopOnPause(int) override;
+    void quitMessageLoopOnPause() override;
+    void runIfWaitingForDebugger(int) override;
+    double currentTimeMS() override { return platform->CurrentClockTimeMillis(); }
+    v8::Local<v8::Context> ensureDefaultContextInGroup(int) override;
+};
+
+struct InspectorChannel final : public v8_inspector::V8Inspector::Channel
+{
+    Inspector& in;
+    explicit InspectorChannel(Inspector& in) : in(in) {}
+    void sendResponse(int, std::unique_ptr<v8_inspector::StringBuffer> m) override;
+    void sendNotification(std::unique_ptr<v8_inspector::StringBuffer> m) override;
+    void flushProtocolNotifications() override {}
+};
+
+} // namespace anonymous
+
+struct Inspector
+{
+    State& st;
+    std::string title;
+    InspectorClient client{*this};
+    InspectorChannel channel{*this};
+    // Created with the context, not on first attach: V8 tags each script
+    // with its context's inspector id at compile time, so code compiled
+    // before contextCreated() could never be debugged. The cost is that V8
+    // routes console.* into the inspector's message storage, which keeps the
+    // last 1000 calls' arguments alive.
+    std::unique_ptr<v8_inspector::V8Inspector> inspector;
+    std::unique_ptr<v8_inspector::V8InspectorSession> session;
+    std::shared_ptr<mri::Target> target;
+    bool paused = false;
+    bool quit_pause = false;
+    // V8 forbids destroying a session from inside its pause loop or a
+    // dispatch; a disconnect then only resumes and the session goes later
+    bool disconnect_pending = false;
+    int dispatch_depth = 0;
+    // read by ruby threads
+    std::atomic<bool> attached{false};
+    std::atomic<bool> ready{false};
+    std::atomic<bool> break_next{false};
+
+    explicit Inspector(State& st) : st(st) {}
+};
+
+namespace {
+
+void inspector_send(Inspector& in, const v8_inspector::StringView& v)
+{
+    mri::send(*in.target, to_utf8(v));
+}
+
+void InspectorChannel::sendResponse(int, std::unique_ptr<v8_inspector::StringBuffer> m)
+{
+    inspector_send(in, m->string());
+}
+
+void InspectorChannel::sendNotification(std::unique_ptr<v8_inspector::StringBuffer> m)
+{
+    inspector_send(in, m->string());
+}
+
+v8::Local<v8::Context> InspectorClient::ensureDefaultContextInGroup(int)
+{
+    return in.st.context;
+}
+
+void InspectorClient::runIfWaitingForDebugger(int)
+{
+    in.ready = true;
+}
+
+void InspectorClient::quitMessageLoopOnPause()
+{
+    in.quit_pause = true;
+}
+
+void inspector_drop_session_if_safe(Inspector& in)
+{
+    if (in.disconnect_pending && !in.paused && in.dispatch_depth == 0) {
+        in.session.reset();
+        in.disconnect_pending = false;
+    }
+}
+
+void inspector_create(Inspector& in)
+{
+    State& st = in.st;
+    v8::HandleScope handle_scope(st.isolate);
+    in.inspector = v8_inspector::V8Inspector::create(st.isolate, &in.client);
+    std::vector<uint16_t> name = utf8_to_utf16(in.title);
+    v8_inspector::V8ContextInfo info(st.context, kContextGroupId,
+                                     v8_inspector::StringView(name.data(), name.size()));
+    info.auxData = latin1_view("{\"isDefault\":true,\"type\":\"default\"}");
+    in.inspector->contextCreated(info);
+}
+
+// Runs every queued frontend event. Returns whether there were any.
+bool inspector_drain(Inspector& in)
+{
+    bool any = false;
+    std::string msg;
+    for (;;) {
+        mri::Event ev = mri::poll(*in.target, &msg);
+        if (ev == mri::Event::None)
+            break;
+        any = true;
+        switch (ev) {
+        case mri::Event::Connect:
+            if (in.session && in.disconnect_pending) {
+                // reconnected before the old session could be dropped;
+                // the new frontend re-enables whatever domains it needs
+                in.disconnect_pending = false;
+            } else {
+                in.session = in.inspector->connect(
+                    kContextGroupId, &in.channel, v8_inspector::StringView(),
+                    v8_inspector::V8Inspector::kFullyTrusted);
+            }
+            in.attached = true;
+            break;
+        case mri::Event::Disconnect:
+            in.attached = false;
+            in.ready = false;
+            in.break_next = false;
+            if (!in.session)
+                break;
+            in.disconnect_pending = true;
+            if (in.paused) {
+                in.session->resume();
+                in.quit_pause = true;
+            }
+            inspector_drop_session_if_safe(in);
+            break;
+        case mri::Event::Message:
+            if (!in.session || in.disconnect_pending)
+                break;
+            {
+                std::vector<uint16_t> u16 = utf8_to_utf16(msg);
+                in.dispatch_depth++;
+                in.session->dispatchProtocolMessage(
+                    v8_inspector::StringView(u16.data(), u16.size()));
+                in.dispatch_depth--;
+            }
+            inspector_drop_session_if_safe(in);
+            break;
+        case mri::Event::None:
+            break;
+        }
+    }
+    return any;
+}
+
+void InspectorClient::runMessageLoopOnPause(int)
+{
+    if (in.paused)
+        return;
+    State& st = in.st;
+    in.paused = true;
+    in.quit_pause = false;
+    v8_inspector_paused(st.ruby_context, 1); // stops the watchdog clock
+    const int64_t max_pause = v8_inspector_max_pause(st.ruby_context);
+    const auto start = std::chrono::steady_clock::now();
+    while (!in.quit_pause) {
+        // a forgotten breakpoint must not hold the calling thread forever
+        if (max_pause > 0 && std::chrono::steady_clock::now() - start >=
+                                 std::chrono::milliseconds(max_pause)) {
+            request_termination(&st, NON_WATCHDOG_TERMINATION);
+            break;
+        }
+        if (inspector_drain(in))
+            continue;
+        // Context#stop, dispose or a vanished frontend end the pause; V8
+        // then resumes and the pending termination, if any, takes over
+        if (st.terminate_requested.load() || v8_context_quitting(st.ruby_context) || !in.session)
+            break;
+        mri::wait(*in.target, 100);
+    }
+    in.paused = false;
+    v8_inspector_paused(st.ruby_context, 0);
+}
+
+void inspector_interrupt(v8::Isolate *, void *arg)
+{
+    State& st = *static_cast<State*>(arg);
+    Inspector *in = st.inspector.get();
+    // a pause loop or a dispatch further up the stack drains instead
+    if (in && !in->paused && in->dispatch_depth == 0)
+        inspector_drain(*in);
+}
+
+// server thread, with the target's lock held
+void inspector_wake(void *arg)
+{
+    State *pst = static_cast<State*>(arg);
+    v8_inspector_wake(pst->ruby_context);
+    pst->isolate->RequestInterrupt(inspector_interrupt, pst);
+}
+
+void inspector_init(State& st, const char *title)
+{
+    st.inspector = std::make_unique<Inspector>(st);
+    Inspector& in = *st.inspector;
+    in.title = title;
+    inspector_create(in);
+    in.target = mri::register_target(title, inspector_wake, &st);
+}
+
+void inspector_teardown(State& st)
+{
+    Inspector& in = *st.inspector;
+    if (!in.target)
+        return;
+    mri::unregister_target(in.target); // no wakes after this returns
+    in.attached = false;
+    in.ready = false;
+    in.session.reset();
+    if (in.inspector) {
+        v8::HandleScope handle_scope(st.isolate);
+        in.inspector->contextDestroyed(st.context);
+        in.inspector.reset();
+    }
+    in.target.reset();
+    // |in| itself lives until ~State; ruby threads may still read its atomics
+}
+
+void inspector_maybe_break(State& st)
+{
+    Inspector *in = st.inspector.get();
+    if (in && in->session && in->break_next.exchange(false))
+        in->session->schedulePauseOnNextStatement(latin1_view("Break on start"),
+                                                  latin1_view("{}"));
+}
+
 extern "C" State *v8_thread_init(Context *c, const uint8_t *snapshot_buf,
                                  size_t snapshot_len, int64_t max_memory,
-                                 int verbose_exceptions)
+                                 int verbose_exceptions,
+                                 const char *inspector_title)
 {
     State *pst = new State{};
     State& st = *pst;
@@ -531,7 +877,9 @@ extern "C" State *v8_thread_init(Context *c, const uint8_t *snapshot_buf,
             st.persistent_context.Reset(st.isolate, st.context);
             return pst; // intentionally returning early and keeping alive
         }
-        v8_thread_main(c, pst);
+        if (inspector_title)
+            inspector_init(st, inspector_title);
+        v8_thread_main(c, pst); // shuts the inspector down on its way out
     }
     delete pst;
     return nullptr;
@@ -542,6 +890,13 @@ void v8_api_callback(const v8::FunctionCallbackInfo<v8::Value>& info)
     auto ext = v8::External::Cast(*info.Data());
     Callback *cb = static_cast<Callback*>(ext->Value());
     State& st = *cb->st;
+    if (st.inspector_idle) {
+        auto message = v8::String::NewFromUtf8Literal(st.isolate,
+            "Ruby callbacks are unavailable from the debugger while no "
+            "evaluation is running; pause at a breakpoint first");
+        st.isolate->ThrowException(v8::Exception::Error(message));
+        return;
+    }
     v8::Local<v8::Array> request;
     {
         v8::Context::Scope context_scope(st.safe_context);
@@ -774,6 +1129,7 @@ void v8_call_impl(State *pst, const uint8_t *p, size_t n, bool await)
             if (!request->Get(st.context, i).ToLocal(&val)) goto fail;
             args.push_back(val);
         }
+        if (!nested) inspector_maybe_break(st);
         auto maybe_result_v = function->Call(st.context, obj, args.size(), args.data());
         v8::Local<v8::Value> result_v;
         if (!maybe_result_v.ToLocal(&result_v)) goto fail;
@@ -868,6 +1224,7 @@ void v8_eval_impl(State *pst, const uint8_t *p, size_t n, bool await)
         if (!v8::Script::Compile(st.context, source, &origin).ToLocal(&script)) goto fail;
         v8::Local<v8::Value> result_v;
         cause = RUNTIME_ERROR;
+        if (!nested) inspector_maybe_break(st);
         auto maybe_result_v = script->Run(st.context);
         if (!maybe_result_v.ToLocal(&result_v)) goto fail;
         if (await && !await_promise(st, &result_v)) goto fail;
@@ -1534,6 +1891,55 @@ extern "C" void v8_cancel_terminate_execution(State *pst)
     // for the next entry without IsExecutionTerminating() becoming true.
     pst->terminate_requested.store(0);
     pst->isolate->CancelTerminateExecution();
+}
+
+extern "C" void v8_inspector_dispatch(State *pst)
+{
+    State& st = *pst;
+    Inspector *in = st.inspector.get();
+    if (!in || !in->target)
+        return;
+    v8::HandleScope handle_scope(st.isolate);
+    st.inspector_idle = true;
+    inspector_drop_session_if_safe(*in);
+    inspector_drain(*in);
+    st.inspector_idle = false;
+}
+
+extern "C" void v8_inspector_shutdown(State *pst)
+{
+    if (pst->inspector)
+        inspector_teardown(*pst);
+}
+
+extern "C" int v8_inspector_status(State *pst)
+{
+    Inspector *in = pst->inspector.get();
+    if (!in)
+        return 0;
+    return INSPECTOR_ENABLED
+        | (in->attached.load() ? INSPECTOR_ATTACHED : 0)
+        | (in->ready.load() ? INSPECTOR_READY : 0);
+}
+
+extern "C" void v8_inspector_break_next(State *pst)
+{
+    if (Inspector *in = pst->inspector.get())
+        in->break_next = true;
+}
+
+extern "C" int v8_inspector_start(const char *host, int port, char *err, size_t errlen)
+{
+    std::string e;
+    int r = mri::start_server(host, port, &e);
+    if (r < 0)
+        snprintf(err, errlen, "%s", e.c_str());
+    return r;
+}
+
+extern "C" int v8_inspector_port(void)
+{
+    return mri::server_port();
 }
 
 extern "C" void v8_single_threaded_enter(State *pst, Context *c, void (*f)(Context *c))

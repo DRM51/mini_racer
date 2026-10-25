@@ -1,4 +1,5 @@
 - Unreleased
+  - Add remote debugging with Chrome DevTools: MiniRacer::Inspector.start, Context.new(inspector:), Context#wait_for_debugger and #debugger_attached?, Context.new(max_pause:)
   - Preserve multiline JavaScript runtime error messages separately from backtraces (#262)
   - Convert Ruby Date values, including nested values and callback results, to JavaScript Date using to_time (#136)
   - Discard Context#load's completion value to avoid invoking getters during result conversion; load now returns nil (#197)
