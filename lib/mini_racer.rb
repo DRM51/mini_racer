@@ -58,6 +58,15 @@ module MiniRacer
   end
 
   class RuntimeError < EvalError
+    # With Context.new(capture_on_throw: true): where the uncaught exception
+    # was thrown and the local variables of each frame, as
+    #   {"reason" => "exception", "frames" => [{"function" => "f",
+    #    "url" => "transform.js", "line" => 3, "column" => 9,
+    #    "scopes" => [{"type" => "local", "variables" => {"x" => 1}}]}]}
+    # Values are copies, cut off at a few levels deep and a few hundred
+    # characters; getters and proxies show as "[Getter]" and "[Proxy]".
+    attr_reader :capture
+
     def initialize(message, stack = "")
       @frames = stack.split("\n").map { "JavaScript #{_1.strip}" }
       super(message)
@@ -136,7 +145,8 @@ module MiniRacer
       deadline =
         timeout && Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
       until __inspector_status & INSPECTOR_READY != 0
-        if deadline && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        if deadline &&
+             Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
           return false
         end
         sleep 0.05
@@ -171,7 +181,12 @@ module MiniRacer
     # someone told the URL can find or attach to a context. chrome://inspect
     # can't discover such targets; open the devtoolsFrontendUrl from
     # Inspector.url instead.
-    def self.start(host: "127.0.0.1", port: DEFAULT_PORT, allow_remote: false, token: nil)
+    def self.start(
+      host: "127.0.0.1",
+      port: DEFAULT_PORT,
+      allow_remote: false,
+      token: nil
+    )
       host = host.to_s
       if !allow_remote && !loopback?(host)
         raise ArgumentError,

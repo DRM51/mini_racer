@@ -41,7 +41,8 @@ void v8_global_init(void);
 struct State *v8_thread_init(struct Context *c, const uint8_t *snapshot_buf,
                              size_t snapshot_len, int64_t max_memory,
                              int verbose_exceptions,
-                             const char *inspector_title); // calls v8_thread_main
+                             const char *inspector_title,
+                             int capture_on_throw); // calls v8_thread_main
 void v8_attach(struct State *pst, const uint8_t *p, size_t n);
 void v8_call(struct State *pst, const uint8_t *p, size_t n);
 void v8_call_await(struct State *pst, const uint8_t *p, size_t n);

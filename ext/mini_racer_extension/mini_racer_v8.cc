@@ -86,6 +86,7 @@ enum : unsigned
 // think we're quite ready yet to drop support for older versions, hence
 // this inelegant "everything" struct.
 struct Inspector; // defined below, only exists when Context.new(inspector:)
+struct Capture;   // defined below, only exists when Context.new(capture_on_throw:)
 
 struct State
 {
@@ -116,6 +117,11 @@ struct State
     std::vector<Callback*> callbacks;
     std::unique_ptr<v8::ArrayBuffer::Allocator> allocator;
     std::unique_ptr<Inspector> inspector;
+    std::unique_ptr<Capture> capture;
+    // what the last uncaught exception's pause recorded, and that exception,
+    // so a failing eval or call can tell the capture belongs to its error
+    v8::Global<v8::Value> captured;
+    v8::Global<v8::Value> captured_exception;
     // true while the inspector runs frontend messages with no ruby call in
     // progress; js -> ruby callbacks have nobody to answer them then
     bool inspector_idle;
@@ -834,10 +840,502 @@ void inspector_maybe_break(State& st)
                                                   latin1_view("{}"));
 }
 
+// --- capture on throw ---
+//
+// Context.new(capture_on_throw: true) keeps an in-process inspector session
+// that pauses on uncaught exceptions. The pause records each frame's
+// location and local variables, then lets the exception continue; the
+// failing eval or call hands the record to Ruby with the error. Unlike
+// inspector: there is no server and nothing waits for a frontend.
+//
+// Recording runs no JavaScript: no getters, no proxy traps, no toString.
+
+constexpr int kCaptureFrames = 10;       // innermost frames recorded
+constexpr int kCaptureDepth = 3;         // nesting below a variable
+constexpr uint32_t kCaptureItems = 50;   // properties or elements per object
+constexpr uint32_t kCaptureString = 500; // UTF-16 units kept of a string
+constexpr int kCaptureValues = 5000;     // values recorded per exception
+
+struct CaptureClient final : public v8_inspector::V8InspectorClient
+{
+    Capture& cap;
+    explicit CaptureClient(Capture& cap) : cap(cap) {}
+    void runMessageLoopOnPause(int) override;
+    double currentTimeMS() override { return platform->CurrentClockTimeMillis(); }
+    v8::Local<v8::Context> ensureDefaultContextInGroup(int) override;
+    void consoleAPIMessage(int, int, v8::Isolate::MessageErrorLevel,
+                           const v8_inspector::StringView&,
+                           const v8_inspector::StringView&, unsigned, unsigned,
+                           v8_inspector::V8StackTrace*) override;
+};
+
+struct CaptureChannel final : public v8_inspector::V8Inspector::Channel
+{
+    Capture& cap;
+    explicit CaptureChannel(Capture& cap) : cap(cap) {}
+    void sendResponse(int, std::unique_ptr<v8_inspector::StringBuffer>) override {}
+    void sendNotification(std::unique_ptr<v8_inspector::StringBuffer> m) override;
+    void flushProtocolNotifications() override {}
+};
+
+} // namespace anonymous
+
+struct Capture
+{
+    State& st;
+    CaptureClient client{*this};
+    CaptureChannel channel{*this};
+    std::unique_ptr<v8_inspector::V8Inspector> inspector;
+    std::unique_ptr<v8_inspector::V8InspectorSession> session;
+    std::string paused;         // the Debugger.paused notification being handled
+    bool console_dirty = false; // console.* calls V8 kept for the inspector
+
+    explicit Capture(State& st) : st(st) {}
+};
+
+namespace {
+
+bool starts_with(const v8_inspector::StringView& v, const char *prefix)
+{
+    size_t n = strlen(prefix);
+    if (v.length() < n) return false;
+    for (size_t i = 0; i < n; i++) {
+        uint16_t c = v.is8Bit() ? v.characters8()[i] : v.characters16()[i];
+        if (c != static_cast<unsigned char>(prefix[i])) return false;
+    }
+    return true;
+}
+
+void CaptureChannel::sendNotification(std::unique_ptr<v8_inspector::StringBuffer> m)
+{
+    // the rest (a scriptParsed for each compiled script) is dropped
+    // without being converted
+    if (starts_with(m->string(), "{\"method\":\"Debugger.paused\""))
+        cap.paused = to_utf8(m->string());
+}
+
+v8::Local<v8::Context> CaptureClient::ensureDefaultContextInGroup(int)
+{
+    return cap.st.context;
+}
+
+void CaptureClient::consoleAPIMessage(int, int, v8::Isolate::MessageErrorLevel,
+                                      const v8_inspector::StringView&,
+                                      const v8_inspector::StringView&, unsigned,
+                                      unsigned, v8_inspector::V8StackTrace*)
+{
+    cap.console_dirty = true;
+}
+
+void capture_dispatch(Capture& cap, const char *message)
+{
+    cap.session->dispatchProtocolMessage(latin1_view(message));
+}
+
+// After each outermost eval or call: drop a capture no error claimed (the
+// exception was a Ruby one, or a rejection handled later), and the
+// arguments of console.* calls, which V8 keeps (up to 1000) for a frontend
+// that capture mode never has.
+void capture_after_eval(State& st)
+{
+    Capture *cap = st.capture.get();
+    if (!cap)
+        return;
+    st.captured.Reset();
+    st.captured_exception.Reset();
+    if (cap->console_dirty) {
+        cap->console_dirty = false;
+        capture_dispatch(*cap, "{\"id\":3,\"method\":\"Runtime.discardConsoleEntries\"}");
+    }
+}
+
+void capture_init(State& st)
+{
+    st.capture = std::make_unique<Capture>(st);
+    Capture& cap = *st.capture;
+    v8::HandleScope handle_scope(st.isolate);
+    cap.inspector = v8_inspector::V8Inspector::create(st.isolate, &cap.client);
+    v8_inspector::V8ContextInfo info(st.context, kContextGroupId, latin1_view("mini_racer"));
+    cap.inspector->contextCreated(info);
+    cap.session = cap.inspector->connect(kContextGroupId, &cap.channel,
+                                         v8_inspector::StringView(),
+                                         v8_inspector::V8Inspector::kFullyTrusted);
+    // scripts are only looked up while paused; keep none after they're collected
+    capture_dispatch(cap, "{\"id\":1,\"method\":\"Debugger.enable\",\"params\":{\"maxScriptsCacheSize\":0}}");
+    capture_dispatch(cap, "{\"id\":2,\"method\":\"Debugger.setPauseOnExceptions\",\"params\":{\"state\":\"uncaught\"}}");
+}
+
+void capture_teardown(State& st)
+{
+    Capture& cap = *st.capture;
+    cap.session.reset();
+    if (cap.inspector) {
+        v8::HandleScope handle_scope(st.isolate);
+        cap.inspector->contextDestroyed(st.context);
+        cap.inspector.reset();
+    }
+}
+
+// V8 reports a verbose TryCatch's exception to message listeners, and
+// prints it when there are none. Capture mode needs verbose TryCatches (see
+// verbose_try_catch) but should stay as quiet as before.
+void capture_message_listener(v8::Local<v8::Message>, v8::Local<v8::Value>) {}
+
+// The debugger counts an exception as caught when a non-verbose TryCatch,
+// mini_racer's default, would catch it, so it would never pause on one
+// that escapes to Ruby. A verbose TryCatch doesn't count.
+bool verbose_try_catch(const State& st)
+{
+    return st.verbose_exceptions || st.capture;
+}
+
+struct CaptureWalk
+{
+    State& st;
+    v8::Local<v8::Context> context; // where the inspected values live
+    int budget = kCaptureValues;
+    std::vector<v8::Local<v8::Object>> path; // for [Circular]
+
+    CaptureWalk(State& st, v8::Local<v8::Context> context) : st(st), context(context) {}
+
+    v8::Local<v8::String> str(const std::string& s)
+    {
+        auto type = v8::NewStringType::kNormal;
+        v8::Local<v8::String> r;
+        if (s.size() <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
+            v8::String::NewFromUtf8(st.isolate, s.data(), type,
+                                    static_cast<int>(s.size())).ToLocal(&r))
+            return r;
+        return v8::String::Empty(st.isolate);
+    }
+
+    std::string utf8(v8::Local<v8::Value> v)
+    {
+        v8::String::Utf8Value s(st.isolate, v);
+        return *s ? std::string(*s, s.length()) : std::string();
+    }
+
+    v8::Local<v8::Array> new_array()
+    {
+        v8::Context::Scope scope(st.safe_context);
+        return v8::Array::New(st.isolate);
+    }
+
+    v8::Local<v8::Object> new_object()
+    {
+        v8::Context::Scope scope(st.safe_context);
+        return v8::Object::New(st.isolate);
+    }
+
+    v8::Local<v8::Value> truncated(v8::Local<v8::String> s)
+    {
+        uint32_t n = static_cast<uint32_t>(s->Length());
+        if (n <= kCaptureString) return s;
+        std::vector<uint16_t> buf(kCaptureString);
+        s->WriteV2(st.isolate, 0, kCaptureString, buf.data());
+        uint32_t keep = kCaptureString;
+        if (buf[keep-1] >= 0xD800 && buf[keep-1] < 0xDC00) keep--; // half a pair
+        v8::Local<v8::String> head;
+        if (!v8::String::NewFromTwoByte(st.isolate, buf.data(), v8::NewStringType::kNormal,
+                                        static_cast<int>(keep)).ToLocal(&head))
+            return str("[string]");
+        return v8::String::Concat(st.isolate, head,
+                                  str("\xE2\x80\xA6 (" + std::to_string(n) + " chars)"));
+    }
+
+    // an own data property, read without running getters or traps
+    bool own_value(v8::Local<v8::Object> o, v8::Local<v8::Name> key,
+                   v8::Local<v8::Value> *value, bool *accessor)
+    {
+        v8::Local<v8::Value> desc_v;
+        if (!o->GetOwnPropertyDescriptor(context, key).ToLocal(&desc_v) || !desc_v->IsObject())
+            return false;
+        auto desc = desc_v.As<v8::Object>();
+        auto value_key = str("value");
+        // the descriptor is a fresh object; only its own fields are safe to read
+        *accessor = !desc->HasOwnProperty(context, value_key).FromMaybe(false);
+        if (*accessor) return true;
+        return desc->Get(context, value_key).ToLocal(value);
+    }
+
+    v8::Local<v8::Value> value(v8::Local<v8::Value> v, int depth)
+    {
+        if (--budget < 0) return str("[\xE2\x80\xA6]");
+        if (v->IsUndefined() || v->IsNull() || v->IsBoolean() || v->IsNumber() ||
+            v->IsBigInt() || v->IsDate())
+            return v;
+        if (v->IsString()) return truncated(v.As<v8::String>());
+        if (v->IsSymbol()) {
+            auto d = v.As<v8::Symbol>()->Description(st.isolate);
+            return str("Symbol(" + (d->IsString() ? utf8(d) : std::string()) + ")");
+        }
+        if (v->IsProxy()) return str("[Proxy]");
+        if (v->IsFunction()) {
+            auto name = utf8(v.As<v8::Function>()->GetDebugName());
+            return str("[Function" + (name.empty() ? std::string() : ": " + name) + "]");
+        }
+        if (v->IsRegExp()) return truncated(v.As<v8::RegExp>()->GetSource());
+        if (v->IsPromise()) {
+            static const char *states[] = {"pending", "fulfilled", "rejected"};
+            return str(std::string("[Promise ") + states[v.As<v8::Promise>()->State()] + "]");
+        }
+        if (!v->IsObject()) return str("[unknown]");
+        auto o = v.As<v8::Object>();
+        std::string cls = utf8(o->GetConstructorName());
+        if (cls.empty()) cls = "Object";
+        if (v->IsArrayBufferView() || v->IsArrayBuffer() || v->IsSharedArrayBuffer() ||
+            v->IsWeakMap() || v->IsWeakSet() || v->IsWeakRef())
+            return str("[" + cls + "]");
+        if (v->IsNativeError()) {
+            v8::Local<v8::Value> message;
+            bool accessor = false;
+            std::string text = cls;
+            if (own_value(o, str("message"), &message, &accessor) && !accessor && message->IsString())
+                text += ": " + utf8(message);
+            return truncated(str(text));
+        }
+        for (auto& seen : path)
+            if (seen->StrictEquals(o)) return str("[Circular]");
+        if (depth >= kCaptureDepth)
+            return str(v->IsArray() ? "[Array]" : "[" + cls + "]");
+        path.push_back(o);
+        v8::Local<v8::Value> r;
+        if (v->IsMap() || v->IsSet())
+            r = collection(o, depth);
+        else if (v->IsArray())
+            r = array(o.As<v8::Array>(), depth);
+        else
+            r = object(o, depth);
+        path.pop_back();
+        return r;
+    }
+
+    // a Map as [[key, value], ...], a Set as [value, ...]
+    v8::Local<v8::Value> collection(v8::Local<v8::Object> o, int depth)
+    {
+        bool pairs = false;
+        v8::Local<v8::Array> entries;
+        auto out = new_array();
+        if (!o->PreviewEntries(&pairs).ToLocal(&entries)) return out;
+        uint32_t n = entries->Length(), step = pairs ? 2 : 1;
+        uint32_t j = 0;
+        for (uint32_t i = 0; i + step - 1 < n && j < kCaptureItems; i += step, j++) {
+            v8::Local<v8::Value> k, val;
+            if (!entries->Get(context, i).ToLocal(&k)) break;
+            if (pairs) {
+                if (!entries->Get(context, i + 1).ToLocal(&val)) break;
+                v8::Local<v8::Value> kv[] = {value(k, depth + 1), value(val, depth + 1)};
+                v8::Local<v8::Array> pair;
+                {
+                    v8::Context::Scope scope(st.safe_context);
+                    pair = v8::Array::New(st.isolate, kv, 2);
+                }
+                out->Set(st.safe_context, j, pair).FromMaybe(false);
+            } else {
+                out->Set(st.safe_context, j, value(k, depth + 1)).FromMaybe(false);
+            }
+        }
+        if (n / step > j)
+            out->Set(st.safe_context, j, str("\xE2\x80\xA6 " + std::to_string(n / step - j) + " more")).FromMaybe(false);
+        return out;
+    }
+
+    v8::Local<v8::Value> array(v8::Local<v8::Array> a, int depth)
+    {
+        uint32_t n = a->Length();
+        auto out = new_array();
+        uint32_t j = 0;
+        for (; j < n && j < kCaptureItems; j++) {
+            v8::Local<v8::Value> val;
+            v8::Local<v8::String> key;
+            bool accessor = false;
+            if (!v8::Integer::NewFromUnsigned(st.isolate, j)->ToString(context).ToLocal(&key) ||
+                !own_value(a, key, &val, &accessor))
+                val = v8::Undefined(st.isolate);
+            out->Set(st.safe_context, j,
+                     accessor ? str("[Getter]").As<v8::Value>() : value(val, depth + 1)).FromMaybe(false);
+        }
+        if (n > j)
+            out->Set(st.safe_context, j, str("\xE2\x80\xA6 " + std::to_string(n - j) + " more")).FromMaybe(false);
+        return out;
+    }
+
+    // own enumerable string-keyed properties; a debugger scope object's
+    // properties are its variables
+    v8::Local<v8::Value> object(v8::Local<v8::Object> o, int depth)
+    {
+        auto out = new_object();
+        v8::Local<v8::Array> names;
+        auto filter = static_cast<v8::PropertyFilter>(v8::ONLY_ENUMERABLE | v8::SKIP_SYMBOLS);
+        if (!o->GetOwnPropertyNames(context, filter, v8::KeyConversionMode::kConvertToString).ToLocal(&names))
+            return out;
+        uint32_t n = names->Length(), kept = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            v8::Local<v8::Value> name_v, val;
+            if (!names->Get(context, i).ToLocal(&name_v) || !name_v->IsString()) continue;
+            if (kept == kCaptureItems) {
+                out->Set(st.safe_context, str("\xE2\x80\xA6"),
+                         str(std::to_string(n - i) + " more")).FromMaybe(false);
+                break;
+            }
+            auto name = name_v.As<v8::String>();
+            bool accessor = false;
+            if (!own_value(o, name, &val, &accessor)) continue;
+            out->Set(st.safe_context, name,
+                     accessor ? str("[Getter]").As<v8::Value>() : value(val, depth + 1)).FromMaybe(false);
+            kept++;
+        }
+        return out;
+    }
+};
+
+v8::Local<v8::Value> get_field(v8::Local<v8::Context> c, v8::Local<v8::Value> o, const char *key)
+{
+    v8::Isolate *isolate = v8::Isolate::GetCurrent();
+    v8::Local<v8::Value> v;
+    if (!o->IsObject() ||
+        !o.As<v8::Object>()->Get(c, v8::String::NewFromUtf8(isolate, key).ToLocalChecked()).ToLocal(&v))
+        return v8::Undefined(isolate);
+    return v;
+}
+
+bool unwrap(Capture& cap, v8::Local<v8::Value> remote, v8::Local<v8::Value> *out)
+{
+    v8::Local<v8::Value> id = get_field(cap.st.safe_context, remote, "objectId");
+    if (!id->IsString()) return false;
+    v8::String::Value id16(cap.st.isolate, id);
+    std::unique_ptr<v8_inspector::StringBuffer> error, group;
+    v8::Local<v8::Context> context;
+    return cap.session->unwrapObject(&error,
+        v8_inspector::StringView(reinterpret_cast<const uint16_t*>(*id16), id16.length()),
+        out, &context, &group);
+}
+
+void capture_record(Capture& cap, const std::string& message)
+{
+    State& st = cap.st;
+    v8::HandleScope handle_scope(st.isolate);
+    v8::TryCatch try_catch(st.isolate); // best effort; never disturbs the exception
+    // CDP leaves a frame's url empty and names scripts only in scriptParsed
+    // events; the pause happens on the throwing stack, which knows them.
+    // Taken before entering the safe context: frames of a context the
+    // current one can't access are left out
+    std::vector<std::pair<int, v8::Local<v8::String>>> script_names;
+    auto trace = v8::StackTrace::CurrentStackTrace(st.isolate, 4 * kCaptureFrames);
+    for (int i = 0; i < trace->GetFrameCount(); i++) {
+        auto f = trace->GetFrame(st.isolate, i);
+        auto name = f->GetScriptNameOrSourceURL();
+        if (!name.IsEmpty())
+            script_names.emplace_back(f->GetScriptId(), name);
+    }
+    v8::Local<v8::Context> sc = st.safe_context;
+    v8::Context::Scope context_scope(sc);
+    CaptureWalk walk(st, st.context);
+    v8::Local<v8::Value> parsed;
+    if (!v8::JSON::Parse(sc, walk.str(message)).ToLocal(&parsed)) return;
+    auto params = get_field(sc, parsed, "params");
+    auto data = get_field(sc, params, "data");
+    if (!get_field(sc, data, "uncaught")->IsTrue()) return;
+    v8::Local<v8::Value> exception;
+    if (!unwrap(cap, data, &exception))
+        exception = get_field(sc, data, "value"); // a thrown primitive; NaN,
+                                                  // -0 etc. come back undefined
+    auto frames_v = get_field(sc, params, "callFrames");
+    if (!frames_v->IsArray()) return;
+    auto frames = frames_v.As<v8::Array>();
+    auto out_frames = walk.new_array();
+    for (uint32_t i = 0, n = frames->Length(); i < n && i < kCaptureFrames; i++) {
+        v8::Local<v8::Value> frame;
+        if (!frames->Get(sc, i).ToLocal(&frame)) break;
+        auto location = get_field(sc, frame, "location");
+        auto line = get_field(sc, location, "lineNumber");
+        auto column = get_field(sc, location, "columnNumber");
+        auto out = walk.new_object();
+        out->Set(sc, walk.str("function"), get_field(sc, frame, "functionName")).FromMaybe(false);
+        v8::Local<v8::Value> url = v8::String::Empty(st.isolate);
+        int script_id = atoi(walk.utf8(get_field(sc, location, "scriptId")).c_str());
+        for (auto& [id, name] : script_names)
+            if (id == script_id) { url = name; break; }
+        out->Set(sc, walk.str("url"), url).FromMaybe(false);
+        // CDP counts from 0; stack traces and editors from 1
+        if (line->IsNumber())
+            out->Set(sc, walk.str("line"), v8::Number::New(st.isolate, line.As<v8::Number>()->Value() + 1)).FromMaybe(false);
+        if (column->IsNumber())
+            out->Set(sc, walk.str("column"), v8::Number::New(st.isolate, column.As<v8::Number>()->Value() + 1)).FromMaybe(false);
+        auto scopes_v = get_field(sc, frame, "scopeChain");
+        auto out_scopes = walk.new_array();
+        uint32_t k = 0;
+        if (scopes_v->IsArray()) {
+            auto scopes = scopes_v.As<v8::Array>();
+            for (uint32_t j = 0; j < scopes->Length(); j++) {
+                v8::Local<v8::Value> scope, object;
+                if (!scopes->Get(sc, j).ToLocal(&scope)) break;
+                std::string type = walk.utf8(get_field(sc, scope, "type"));
+                if (type == "global") continue; // all of globalThis
+                if (!unwrap(cap, get_field(sc, scope, "object"), &object) || !object->IsObject())
+                    continue;
+                auto out_scope = walk.new_object();
+                out_scope->Set(sc, walk.str("type"), walk.str(type)).FromMaybe(false);
+                auto name = get_field(sc, scope, "name");
+                if (name->IsString())
+                    out_scope->Set(sc, walk.str("name"), name).FromMaybe(false);
+                // a scope's variables count as the first level
+                out_scope->Set(sc, walk.str("variables"),
+                               walk.object(object.As<v8::Object>(), -1)).FromMaybe(false);
+                out_scopes->Set(sc, k++, out_scope).FromMaybe(false);
+            }
+        }
+        out->Set(sc, walk.str("scopes"), out_scopes).FromMaybe(false);
+        out_frames->Set(sc, i, out).FromMaybe(false);
+    }
+    auto record = walk.new_object();
+    record->Set(sc, walk.str("reason"), get_field(sc, params, "reason")).FromMaybe(false);
+    record->Set(sc, walk.str("frames"), out_frames).FromMaybe(false);
+    st.captured.Reset(st.isolate, record);
+    st.captured_exception.Reset(st.isolate, exception);
+}
+
+void CaptureClient::runMessageLoopOnPause(int)
+{
+    std::string message;
+    message.swap(cap.paused);
+    if (!message.empty())
+        capture_record(cap, message);
+    // returning resumes; there is no frontend to wait for
+}
+
+// Appends the capture to a runtime error's [message, stack] when it was
+// recorded for this very exception, and drops it either way.
+v8::Local<v8::Value> with_capture(State& st, v8::TryCatch *try_catch, int cause,
+                                  v8::Local<v8::Value> err)
+{
+    if (st.captured.IsEmpty())
+        return err;
+    auto captured = v8::Local<v8::Value>::New(st.isolate, st.captured);
+    auto exception = v8::Local<v8::Value>::New(st.isolate, st.captured_exception);
+    st.captured.Reset();
+    st.captured_exception.Reset();
+    auto thrown = try_catch->Exception();
+    bool same = !thrown.IsEmpty() &&
+        (thrown->SameValue(exception) || (exception->IsUndefined() && !thrown->IsObject()));
+    if (cause != RUNTIME_ERROR || !same)
+        return err;
+    if (err->IsArray()) {
+        auto fields = err.As<v8::Array>();
+        fields->Set(st.safe_context, fields->Length(), captured).FromMaybe(false);
+        return err;
+    }
+    // a thrown primitive has no stack, so its error is the bare message
+    v8::Local<v8::Value> fields[] = {err, v8::String::Empty(st.isolate), captured};
+    v8::Context::Scope context_scope(st.safe_context);
+    return v8::Array::New(st.isolate, fields, 3);
+}
+
 extern "C" State *v8_thread_init(Context *c, const uint8_t *snapshot_buf,
                                  size_t snapshot_len, int64_t max_memory,
                                  int verbose_exceptions,
-                                 const char *inspector_title)
+                                 const char *inspector_title,
+                                 int capture_on_throw)
 {
     State *pst = new State{};
     State& st = *pst;
@@ -892,6 +1390,11 @@ extern "C" State *v8_thread_init(Context *c, const uint8_t *snapshot_buf,
         }
         if (inspector_title)
             inspector_init(st, inspector_title);
+        if (capture_on_throw) {
+            capture_init(st);
+            if (!st.verbose_exceptions)
+                st.isolate->AddMessageListener(capture_message_listener);
+        }
         v8_thread_main(c, pst); // shuts the inspector down on its way out
     }
     delete pst;
@@ -1092,7 +1595,7 @@ void v8_call_impl(State *pst, const uint8_t *p, size_t n, bool await)
 {
     State& st = *pst;
     v8::TryCatch try_catch(st.isolate);
-    try_catch.SetVerbose(st.verbose_exceptions);
+    try_catch.SetVerbose(verbose_try_catch(st));
     v8::HandleScope handle_scope(st.isolate);
     v8::ValueDeserializer des(st.isolate, p, n);
     std::vector<v8::Local<v8::Value>> args;
@@ -1168,6 +1671,7 @@ fail:
     if (!cause && try_catch.HasCaught()) cause = RUNTIME_ERROR;
     if (cause) result = v8::Undefined(st.isolate);
     auto err = to_error(st, &try_catch, cause);
+    err = with_capture(st, &try_catch, cause, err);
     // Error formatting can run user JS (for example Error.prepareStackTrace)
     // which may call Context#stop. Do not let that termination leak into the
     // reply or the next evaluation.
@@ -1188,6 +1692,7 @@ fail:
         assert(try_catch.HasCaught());
         goto fail; // retry; can be termination exception
     }
+    if (!nested) capture_after_eval(st);
     if (!nested &&
         (st.terminate_requested.load() || st.isolate->IsExecutionTerminating())) {
         // A callback invoked by the serializer (for example a getter) can
@@ -1215,7 +1720,7 @@ void v8_eval_impl(State *pst, const uint8_t *p, size_t n, bool await)
 {
     State& st = *pst;
     v8::TryCatch try_catch(st.isolate);
-    try_catch.SetVerbose(st.verbose_exceptions);
+    try_catch.SetVerbose(verbose_try_catch(st));
     v8::HandleScope handle_scope(st.isolate);
     v8::ValueDeserializer des(st.isolate, p, n);
     des.ReadHeader(st.context).Check();
@@ -1262,6 +1767,7 @@ fail:
     if (!cause && try_catch.HasCaught()) cause = RUNTIME_ERROR;
     if (cause) result = v8::Undefined(st.isolate);
     auto err = to_error(st, &try_catch, cause);
+    err = with_capture(st, &try_catch, cause, err);
     // Error formatting can run user JS (for example Error.prepareStackTrace)
     // which may call Context#stop. Do not let that termination leak into the
     // reply or the next evaluation.
@@ -1282,6 +1788,7 @@ fail:
         assert(try_catch.HasCaught());
         goto fail; // retry; can be termination exception
     }
+    if (!nested) capture_after_eval(st);
     if (!nested &&
         (st.terminate_requested.load() || st.isolate->IsExecutionTerminating())) {
         // A callback invoked by the serializer (for example a getter) can
@@ -1932,6 +2439,8 @@ extern "C" void v8_inspector_shutdown(State *pst)
 {
     if (pst->inspector)
         inspector_teardown(*pst);
+    if (pst->capture)
+        capture_teardown(*pst);
 }
 
 extern "C" int v8_inspector_status(State *pst)
@@ -1999,6 +2508,8 @@ State::~State()
         persistent_safe_context.Reset();
         persistent_context.Reset();
         ruby_exception.Reset();
+        captured.Reset();
+        captured_exception.Reset();
     }
     isolate->Dispose();
     for (Callback *cb : callbacks)
