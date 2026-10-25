@@ -1,3 +1,7 @@
+- 0.22.2.3 - 25-10-2026
+  - DRM51 build: 0.22.2.1 plus the change below
+  - Add `Context.new(date: :iso)`, which passes a date-only `Date` to JavaScript as an ISO 8601 string (`"2026-10-25"`) instead of a `Date` at local midnight, and `Context.new(decimal: :float)`, which passes a `BigDecimal` as a number instead of `"Undefined Conversion"`. Both apply to attached function results and `Context#call` arguments; the defaults are unchanged
+
 - 0.22.2.1 - 25-10-2026
   - DRM51 build: upstream 0.22.2 and its unreleased fixes, plus the changes below. The fourth version segment numbers our builds; upstream does not use it
   - Add remote debugging with Chrome DevTools: `MiniRacer::Inspector.start(port:, host:, token:, allow_remote:)`, `Context.new(inspector:, max_pause:)`, `Context#wait_for_debugger`, `Context#debugger_attached?`, `Inspector.url`
