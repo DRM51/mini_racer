@@ -1211,7 +1211,7 @@ struct CaptureWalk
             return v8::Boolean::New(st.isolate, v.As<v8::BooleanObject>()->ValueOf());
         if (!v->IsObject()) return str("[unknown]");
         auto o = v.As<v8::Object>();
-        std::string cls = utf8(o->GetConstructorName()).substr(0, kCaptureString);
+        std::string cls = utf8(truncated(o->GetConstructorName()));
         if (cls.empty()) cls = "Object";
         if (v->IsArrayBufferView() || v->IsArrayBuffer() || v->IsSharedArrayBuffer() ||
             v->IsWeakMap() || v->IsWeakSet() || v->IsWeakRef() || v->IsSymbolObject() ||
@@ -1303,9 +1303,9 @@ struct CaptureWalk
     // properties are its variables
     v8::Local<v8::Value> object(v8::Local<v8::Object> o, int depth)
     {
-        if (stopped) return str("[\xE2\x80\xA6]"); // don't list the keys
         v8::EscapableHandleScope scope(st.isolate);
         auto out = new_object();
+        if (stopped) return scope.Escape(out); // out of room: don't list the keys
         v8::Local<v8::Array> names;
         auto filter = static_cast<v8::PropertyFilter>(v8::ONLY_ENUMERABLE | v8::SKIP_SYMBOLS);
         if (!o->GetOwnPropertyNames(context, filter, v8::KeyConversionMode::kConvertToString).ToLocal(&names))
@@ -1429,12 +1429,15 @@ void capture_record(Capture& cap, const std::string& message)
         auto line = get_field(sc, location, "lineNumber");
         auto column = get_field(sc, location, "columnNumber");
         auto out = walk.new_object();
-        walk.put(out, walk.str("function"), get_field(sc, frame, "functionName"));
+        auto function = get_field(sc, frame, "functionName");
+        walk.put(out, walk.str("function"),
+                 function->IsString() ? walk.truncated(function.As<v8::String>()) : function);
         v8::Local<v8::Value> url = v8::String::Empty(st.isolate);
         int script_id = atoi(walk.utf8(get_field(sc, location, "scriptId")).c_str());
         for (auto& [id, name] : script_names)
             if (id == script_id) { url = name; break; }
-        walk.put(out, walk.str("url"), url);
+        walk.put(out, walk.str("url"),
+                 url->IsString() ? walk.truncated(url.As<v8::String>()) : url);
         // CDP counts from 0; stack traces and editors from 1
         if (line->IsNumber())
             walk.put(out, walk.str("line"), v8::Number::New(st.isolate, line.As<v8::Number>()->Value() + 1));
@@ -1460,7 +1463,7 @@ void capture_record(Capture& cap, const std::string& message)
                 walk.put(out_scope, walk.str("type"), walk.str(type));
                 auto name = get_field(sc, scope, "name");
                 if (name->IsString())
-                    walk.put(out_scope, walk.str("name"), name);
+                    walk.put(out_scope, walk.str("name"), walk.truncated(name.As<v8::String>()));
                 // a scope's variables count as the first level
                 walk.put(out_scope, walk.str("variables"), walk.object(object.As<v8::Object>(), -1));
                 walk.put(out_scopes, k++, out_scope);
