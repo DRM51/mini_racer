@@ -6,6 +6,7 @@
 #include "mini_racer_inspector.h"
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -874,6 +875,7 @@ constexpr int kCaptureValues = 5000;     // values recorded per exception
 constexpr int kCaptureMillis = 100;      // time spent recording per exception
 constexpr size_t kCaptureCollection = 10000; // larger Maps and Sets: just the size
 constexpr size_t kCaptureRecords = 8;    // pauses waiting for their error
+constexpr size_t kCapturePauseMessage = 16 << 20; // larger pauses aren't recorded
 
 struct CaptureClient final : public v8_inspector::V8InspectorClient
 {
@@ -931,8 +933,12 @@ void CaptureChannel::sendNotification(std::unique_ptr<v8_inspector::StringBuffer
 {
     // the rest (a scriptParsed for each compiled script) is dropped
     // without being converted
-    if (starts_with(m->string(), "{\"method\":\"Debugger.paused\""))
-        cap.paused = to_utf8(m->string());
+    // V8 has already spent the time building a huge one (a long thrown
+    // string, thousands of frames); don't spend more parsing it
+    auto v = m->string();
+    if (v.length() <= kCapturePauseMessage &&
+        starts_with(v, "{\"method\":\"Debugger.paused\""))
+        cap.paused = to_utf8(v);
 }
 
 v8::Local<v8::Context> CaptureClient::ensureDefaultContextInGroup(int)
@@ -1021,7 +1027,6 @@ struct CaptureWalk
     v8::Local<v8::Map> seen[kCaptureDepth];
     std::vector<v8::Local<v8::Object>> path; // for [Circular]
     std::chrono::steady_clock::time_point deadline;
-    unsigned ticks = 0;
     bool stopped = false;
 
     CaptureWalk(State& st, v8::Local<v8::Context> context)
@@ -1037,10 +1042,9 @@ struct CaptureWalk
     bool exhausted()
     {
         if (!stopped && (--budget < 0 ||
-                         ((++ticks & 31) == 0 &&
-                          (st.terminate_requested.load() ||
-                           st.isolate->IsExecutionTerminating() ||
-                           std::chrono::steady_clock::now() > deadline))))
+                         st.terminate_requested.load() ||
+                         st.isolate->IsExecutionTerminating() ||
+                         std::chrono::steady_clock::now() > deadline))
             stopped = true;
         return stopped;
     }
@@ -1162,8 +1166,10 @@ struct CaptureWalk
         if (v->IsUndefined() || v->IsNull() || v->IsBoolean() || v->IsNumber())
             return v;
         if (v->IsDate()) { // a copy: the script may change it after the throw
+            double t = v.As<v8::Date>()->ValueOf();
             v8::Local<v8::Value> copy;
-            if (v8::Date::New(st.safe_context, v.As<v8::Date>()->ValueOf()).ToLocal(&copy))
+            if (std::isnan(t)) return str("Invalid Date"); // Ruby can't take it
+            if (v8::Date::New(st.safe_context, t).ToLocal(&copy))
                 return copy;
             return str("[Date]");
         }
@@ -1195,7 +1201,7 @@ struct CaptureWalk
             return v8::Boolean::New(st.isolate, v.As<v8::BooleanObject>()->ValueOf());
         if (!v->IsObject()) return str("[unknown]");
         auto o = v.As<v8::Object>();
-        std::string cls = utf8(o->GetConstructorName());
+        std::string cls = utf8(o->GetConstructorName()).substr(0, kCaptureString);
         if (cls.empty()) cls = "Object";
         if (v->IsArrayBufferView() || v->IsArrayBuffer() || v->IsSharedArrayBuffer() ||
             v->IsWeakMap() || v->IsWeakSet() || v->IsWeakRef() || v->IsSymbolObject() ||
@@ -1305,7 +1311,9 @@ struct CaptureWalk
             auto name = name_v.As<v8::String>();
             bool accessor = false;
             if (!own_value(o, name, &val, &accessor)) continue;
-            put(out, name, accessor ? getter() : value(val, depth + 1));
+            auto key = name->Length() > static_cast<int>(kCaptureString)
+                ? truncated(name).As<v8::String>() : name;
+            put(out, key, accessor ? getter() : value(val, depth + 1));
             kept++;
         }
         return scope.Escape(out);
