@@ -231,6 +231,49 @@ In production, prefer debugging outside the request path (a console or runner
 process replaying one job) over Puma workers, keep `max_pause:` short (say
 60–120 seconds) and always pass `wait_for_debugger` a `timeout:`.
 
+### Locals of an uncaught exception
+
+`capture_on_throw: true` records where an uncaught exception was thrown and
+the local variables of each frame, without a debugger attached:
+
+```ruby
+context = MiniRacer::Context.new(capture_on_throw: true)
+context.eval(source, filename: "transform.js")
+begin
+  context.call("transform", rows)
+rescue MiniRacer::RuntimeError => e
+  e.capture
+  # => {"reason" => "exception",
+  #     "frames" => [{"function" => "transform", "url" => "transform.js",
+  #                   "line" => 12, "column" => 31,
+  #                   "scopes" => [{"type" => "local", "name" => "transform",
+  #                                 "variables" => {"row" => {"customer" => nil}, "i" => 1}},
+  #                                {"type" => "closure", ...}, {"type" => "script", ...}]},
+  #                  ...]}
+end
+```
+
+- An exception counts as uncaught when no JavaScript `catch` handles it: one
+  that reaches `eval`/`call`, and a rejection `eval_await`/`call_await` is
+  waiting on (`"reason" => "promiseRejection"`). Exceptions caught in
+  JavaScript are not recorded. A Ruby exception raised by an attached function
+  propagates unchanged, without a capture.
+- Up to 10 frames, innermost first; `line` and `column` count from 1 and match
+  the backtrace. Each frame's scopes are listed innermost first (`block`,
+  `local`, `closure`, `script` for top-level `let`/`const`, ...), never
+  `globalThis`.
+- Values are copies, taken without running any JavaScript: getters show as
+  `"[Getter]"`, proxies as `"[Proxy]"`, functions as `"[Function: name]"`,
+  errors as `"TypeError: message"`. Objects are cut off three levels below a
+  variable (`"[Object]"`), at 50 properties or elements (`"… 20 more"`) and
+  strings at 500 characters; `Map`s become `[[key, value], ...]` and `Set`s
+  arrays.
+- The capture costs about 0.2 ms per failing call. Code that doesn't throw
+  runs at the same speed, but each `eval` (each script compiled) costs about
+  15 µs more, and each `throw` caught in JavaScript about 0.5 µs more.
+- Can't be combined with `inspector:`, and is not available in
+  `:single_threaded` mode or on TruffleRuby.
+
 ### Fork Safety
 
 Some Ruby web servers employ forking (for example unicorn or puma in clustered mode). V8 is not fork safe by default and sadly Ruby does not have support for fork notifications per [#5446](https://bugs.ruby-lang.org/issues/5446).
