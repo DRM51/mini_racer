@@ -159,7 +159,23 @@ typedef struct Context
         int active; // dispatch thread only
         int cancel; // protected by |mtx|
     } wd; // watchdog
+    struct {
+        pthread_t thr;
+        pthread_mutex_t mtx;
+        pthread_cond_t cv;
+        int active; // v8 thread only
+        int cancel; // protected by |mtx|
+    } pw; // pause watchdog, enforces |max_pause|
     Barrier early_init, late_init;
+    // inspector (Chrome DevTools Protocol); see mini_racer_inspector.h
+    int inspector;               // set by Context.new(inspector:)
+    char inspector_title[256];
+    int64_t max_pause;           // ms a breakpoint may hold the caller; 0 = no cap
+    int inspector_pending;       // protected by |mtx|
+    atomic_int dbg_paused;       // v8 thread is stopped at a breakpoint
+    atomic_llong dbg_paused_ms;  // total time spent paused; the watchdog
+                                 // does not count it against |timeout|
+    int64_t dbg_pause_start_ms;  // v8 thread only
 } Context;
 
 typedef struct Snapshot {
@@ -813,20 +829,52 @@ static int deadline_exceeded(struct timespec deadline)
     return timespec_le(deadline, deadline_ms(0));
 }
 
+static int64_t monotonic_ms(void)
+{
+    struct timespec t;
+
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec*1000 + t.tv_nsec/1000000;
+}
+
+static void timespec_add_ms(struct timespec *t, int64_t ms)
+{
+    static const int64_t ns_per_sec = 1000*1000*1000;
+
+    t->tv_sec += ms/1000;
+    t->tv_nsec += ms%1000 * ns_per_sec/1000;
+    while (t->tv_nsec >= ns_per_sec) {
+        t->tv_nsec -= ns_per_sec;
+        t->tv_sec++;
+    }
+}
+
 static void *v8_watchdog(void *arg)
 {
-    struct timespec deadline;
+    struct timespec deadline, until;
+    int64_t seen, paused_ms;
     Context *c;
 
     c = arg;
     deadline = deadline_ms(c->timeout);
+    seen = atomic_load(&c->dbg_paused_ms);
     pthread_mutex_lock(&c->wd.mtx);
     for (;;) {
         if (c->wd.cancel)
             break;
-        pthread_cond_timedwait(&c->wd.cv, &c->wd.mtx, &deadline);
+        // time spent stopped at a breakpoint doesn't count: push the
+        // deadline out by it, and only poll while a pause is ongoing
+        paused_ms = atomic_load(&c->dbg_paused_ms);
+        if (paused_ms != seen) {
+            timespec_add_ms(&deadline, paused_ms - seen);
+            seen = paused_ms;
+        }
+        until = atomic_load(&c->dbg_paused) ? deadline_ms(100) : deadline;
+        pthread_cond_timedwait(&c->wd.cv, &c->wd.mtx, &until);
         if (c->wd.cancel)
             break;
+        if (atomic_load(&c->dbg_paused) || atomic_load(&c->dbg_paused_ms) != seen)
+            continue;
         if (deadline_exceeded(deadline)) {
             v8_terminate_watchdog(c->pst);
             break;
@@ -926,7 +974,7 @@ void v8_thread_main(Context *c, struct State *pst)
     barrier_wait(&c->late_init);
     pthread_mutex_lock(&c->mtx);
     while (!c->quit) {
-        if (!c->req.len) {
+        if (!c->req.len && !c->inspector_pending) {
             if (c->idle_gc > 0) {
                 deadline = deadline_ms(c->idle_gc);
                 pthread_cond_timedwait(&c->cv, &c->mtx, &deadline);
@@ -938,12 +986,25 @@ void v8_thread_main(Context *c, struct State *pst)
                 pthread_cond_wait(&c->cv, &c->mtx);
             }
         }
+        if (c->inspector_pending) {
+            c->inspector_pending = 0;
+            pthread_mutex_unlock(&c->mtx);
+            v8_inspector_dispatch(c->pst);
+            pthread_mutex_lock(&c->mtx);
+            continue;
+        }
         if (!c->req.len)
             continue; // spurious wakeup or quit signal from other thread
         dispatch(c);
         issued_idle_gc = false;
         pthread_cond_signal(&c->cv);
     }
+    // The inspector server thread takes the target lock, then |mtx| (to
+    // wake us); shutting the inspector down takes the target lock, so it
+    // must not run with |mtx| held.
+    pthread_mutex_unlock(&c->mtx);
+    v8_inspector_shutdown(pst);
+    pthread_mutex_lock(&c->mtx);
 }
 
 // called by v8_thread_main and from mini_racer_v8.cc
@@ -980,6 +1041,73 @@ void v8_roundtrip(Context *c, const uint8_t **p, size_t *n)
     pthread_mutex_unlock(&c->mtx);
 }
 
+// called from the inspector server thread
+void v8_inspector_wake(Context *c)
+{
+    pthread_mutex_lock(&c->mtx);
+    c->inspector_pending = 1;
+    pthread_cond_signal(&c->cv);
+    pthread_mutex_unlock(&c->mtx);
+}
+
+// Ends a pause that runs past |max_pause|. A thread of its own, because
+// the v8 thread's pause loop can't check the clock while it runs a debugger
+// expression (Debugger.evaluateOnCallFrame) that never returns.
+static void *v8_pause_watchdog(void *arg)
+{
+    struct timespec deadline;
+    Context *c;
+
+    c = arg;
+    deadline = deadline_ms(c->max_pause);
+    pthread_mutex_lock(&c->pw.mtx);
+    while (!c->pw.cancel) {
+        if (pthread_cond_timedwait(&c->pw.cv, &c->pw.mtx, &deadline) == ETIMEDOUT &&
+            !c->pw.cancel) {
+            v8_terminate_execution(c->pst);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&c->pw.mtx);
+    return NULL;
+}
+
+// called from the v8 thread when it enters or leaves a breakpoint
+void v8_inspector_paused(Context *c, int paused)
+{
+    if (paused) {
+        c->dbg_pause_start_ms = monotonic_ms();
+        atomic_store(&c->dbg_paused, 1);
+        if (c->max_pause > 0 && !c->pw.active) {
+            c->pw.cancel = 0;
+            c->pw.active = !pthread_create(&c->pw.thr, NULL, v8_pause_watchdog, c);
+        }
+    } else {
+        if (c->pw.active) {
+            pthread_mutex_lock(&c->pw.mtx);
+            c->pw.cancel = 1;
+            pthread_cond_signal(&c->pw.cv);
+            pthread_mutex_unlock(&c->pw.mtx);
+            pthread_join(c->pw.thr, NULL);
+            c->pw.active = 0;
+        }
+        // publish the total before clearing the flag so the watchdog never
+        // sees "not paused" without the time that pause took
+        atomic_fetch_add(&c->dbg_paused_ms, monotonic_ms() - c->dbg_pause_start_ms);
+        atomic_store(&c->dbg_paused, 0);
+    }
+}
+
+int64_t v8_inspector_max_pause(Context *c)
+{
+    return c->max_pause;
+}
+
+int v8_context_quitting(Context *c)
+{
+    return atomic_load(&c->quit) != 0;
+}
+
 void v8_reply(Context *c, const uint8_t *p, size_t n)
 {
     pthread_mutex_lock(&c->mtx);
@@ -1000,7 +1128,8 @@ static void *v8_thread_start(void *arg)
     c = arg;
     barrier_wait(&c->early_init);
     v8_once_init();
-    v8_thread_init(c, c->snapshot.buf, c->snapshot.len, c->max_memory, c->verbose_exceptions);
+    v8_thread_init(c, c->snapshot.buf, c->snapshot.len, c->max_memory, c->verbose_exceptions,
+                   c->inspector ? c->inspector_title : NULL);
     while (c->quit < 2)
         pthread_cond_wait(&c->cv, &c->mtx);
     context_destroy(c);
@@ -1574,6 +1703,7 @@ static VALUE context_alloc(VALUE klass)
     memset(c, 0, sizeof(*c));
     c->exception = Qnil;
     c->procs = rb_ary_new();
+    c->max_pause = 10*60*1000;
     buf_init(&c->snapshot);
     buf_init(&c->req);
     buf_init(&c->res);
@@ -1604,9 +1734,15 @@ static VALUE context_alloc(VALUE klass)
     cause = "pthread_cond_init";
     if (pthread_cond_init(&c->wd.cv, &cattr))
         goto fail5;
+    cause = "pthread_mutex_init";
+    if ((r = pthread_mutex_init(&c->pw.mtx, NULL)))
+        goto fail6;
+    cause = "pthread_cond_init";
+    if ((r = pthread_cond_init(&c->pw.cv, &cattr)))
+        goto fail6a;
     cause = "barrier_init";
     if ((r = barrier_init(&c->early_init, 2)))
-        goto fail6;
+        goto fail6b;
     cause = "barrier_init";
     if ((r = barrier_init(&c->late_init, 2)))
         goto fail7;
@@ -1614,6 +1750,10 @@ static VALUE context_alloc(VALUE klass)
     return TypedData_Wrap_Struct(klass, &context_type, c);
 fail7:
     barrier_destroy(&c->early_init);
+fail6b:
+    pthread_cond_destroy(&c->pw.cv);
+fail6a:
+    pthread_mutex_destroy(&c->pw.mtx);
 fail6:
     pthread_cond_destroy(&c->wd.cv);
 fail5:
@@ -1695,6 +1835,8 @@ static void context_destroy(Context *c)
     barrier_destroy(&c->late_init);
     pthread_mutex_destroy(&c->wd.mtx);
     pthread_cond_destroy(&c->wd.cv);
+    pthread_mutex_destroy(&c->pw.mtx);
+    pthread_cond_destroy(&c->pw.cv);
     buf_reset(&c->snapshot);
     buf_reset(&c->req);
     buf_reset(&c->res);
@@ -1810,6 +1952,55 @@ static VALUE context_stop(VALUE self)
         rb_raise(context_disposed_error, "disposed context");
     v8_terminate_execution(c->pst);
     return Qnil;
+}
+
+static VALUE context_inspector_status(VALUE self)
+{
+    Context *c;
+
+    TypedData_Get_Struct(self, Context, &context_type, c);
+    if (atomic_load(&c->quit))
+        rb_raise(context_disposed_error, "disposed context");
+    if (!c->inspector || !c->pst)
+        return INT2FIX(0);
+    return INT2FIX(v8_inspector_status(c->pst));
+}
+
+static VALUE context_inspector_break_next(VALUE self)
+{
+    Context *c;
+
+    TypedData_Get_Struct(self, Context, &context_type, c);
+    if (atomic_load(&c->quit))
+        rb_raise(context_disposed_error, "disposed context");
+    if (c->inspector && c->pst)
+        v8_inspector_break_next(c->pst);
+    return Qnil;
+}
+
+static VALUE inspector_start(VALUE self, VALUE host, VALUE port, VALUE token)
+{
+    char err[256];
+    int r;
+
+    StringValue(host);
+    StringValue(token);
+    Check_Type(port, T_FIXNUM);
+    if (FIX2LONG(port) < 0 || FIX2LONG(port) > 65535)
+        rb_raise(rb_eArgError, "bad port");
+    r = v8_inspector_start(StringValueCStr(host), (int)FIX2LONG(port),
+                           StringValueCStr(token), err, sizeof(err));
+    if (r < 0)
+        rb_raise(runtime_error, "inspector: %s", err);
+    return INT2FIX(r);
+}
+
+static VALUE inspector_port(VALUE self)
+{
+    int r;
+
+    r = v8_inspector_port();
+    return r < 0 ? Qnil : INT2FIX(r);
 }
 
 static VALUE context_call_common(int argc, VALUE *argv, VALUE self, char op)
@@ -2096,6 +2287,25 @@ out:
         rb_thread_lock_native_thread();
 }
 
+static void set_inspector_title(Context *c, VALUE title)
+{
+    long n;
+
+    StringValue(title);
+    title = rb_str_export_to_enc(title, rb_utf8_encoding());
+    n = RSTRING_LEN(title);
+    if (n > (long)sizeof(c->inspector_title) - 1) {
+        n = sizeof(c->inspector_title) - 1;
+        // don't cut a UTF-8 sequence in half
+        while (n > 0 && (RSTRING_PTR(title)[n] & 0xC0) == 0x80)
+            n--;
+    }
+    memcpy(c->inspector_title, RSTRING_PTR(title), n);
+    c->inspector_title[n] = '\0';
+    if (strlen(c->inspector_title) != (size_t)n)
+        rb_raise(rb_eArgError, "inspector name contains a NUL byte");
+}
+
 static VALUE context_initialize(int argc, VALUE *argv, VALUE self)
 {
     VALUE kwargs, a, k, v;
@@ -2143,6 +2353,18 @@ static VALUE context_initialize(int argc, VALUE *argv, VALUE self)
                 rb_raise(runtime_error, "out of memory");
         } else if (!strcmp(s, "verbose_exceptions")) {
             c->verbose_exceptions = !(v == Qfalse || v == Qnil);
+        } else if (!strcmp(s, "max_pause")) {
+            Check_Type(v, T_FIXNUM);
+            c->max_pause = FIX2LONG(v);
+            if (c->max_pause < 0 || c->max_pause > INT32_MAX)
+                rb_raise(rb_eArgError, "bad max_pause");
+        } else if (!strcmp(s, "inspector")) {
+            if (v == Qfalse || v == Qnil)
+                continue;
+            if (single_threaded)
+                rb_raise(rb_eArgError, "inspector is not supported in single_threaded mode");
+            c->inspector = 1;
+            set_inspector_title(c, v == Qtrue ? rb_str_new_cstr("mini_racer") : v);
         } else {
             rb_raise(runtime_error, "bad keyword: %s", s);
         }
@@ -2150,7 +2372,7 @@ static VALUE context_initialize(int argc, VALUE *argv, VALUE self)
 init:
     if (single_threaded) {
         v8_once_init();
-        c->pst = v8_thread_init(c, c->snapshot.buf, c->snapshot.len, c->max_memory, c->verbose_exceptions);
+        c->pst = v8_thread_init(c, c->snapshot.buf, c->snapshot.len, c->max_memory, c->verbose_exceptions, NULL);
     } else {
         cause = "pthread_attr_init";
         if ((r = pthread_attr_init(&attr)))
@@ -2339,6 +2561,8 @@ void Init_mini_racer_extension(void)
     rb_define_method(c, "perform_microtask_checkpoint", context_perform_microtask_checkpoint, 0);
     rb_define_method(c, "pump_message_loop", context_pump_message_loop, 0);
     rb_define_method(c, "low_memory_notification", context_low_memory_notification, 0);
+    rb_define_private_method(c, "__inspector_status", context_inspector_status, 0);
+    rb_define_private_method(c, "__inspector_break_next", context_inspector_break_next, 0);
     rb_define_alloc_func(c, context_alloc);
 
     c = snapshot_class = rb_define_class_under(m, "Snapshot", rb_cObject);
@@ -2348,6 +2572,10 @@ void Init_mini_racer_extension(void)
     rb_define_method(c, "size", snapshot_size0, 0);
     rb_define_singleton_method(c, "load", snapshot_load, 1);
     rb_define_alloc_func(c, snapshot_alloc);
+
+    c = rb_define_module_under(m, "Inspector");
+    rb_define_private_method(rb_singleton_class(c), "__start", inspector_start, 3);
+    rb_define_singleton_method(c, "port", inspector_port, 0);
 
     c = rb_define_class_under(m, "Platform", rb_cObject);
     rb_define_singleton_method(c, "set_flags!", platform_set_flags, -1);

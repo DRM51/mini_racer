@@ -31,12 +31,17 @@ void v8_thread_main(struct Context *c, struct State *pst);
 void v8_dispatch(struct Context *c);
 void v8_reply(struct Context *c, const uint8_t *p, size_t n);
 void v8_roundtrip(struct Context *c, const uint8_t **p, size_t *n);
+void v8_inspector_wake(struct Context *c); // any thread; wakes an idle v8 thread
+void v8_inspector_paused(struct Context *c, int paused); // v8 thread
+int v8_context_quitting(struct Context *c);
+int64_t v8_inspector_max_pause(struct Context *c); // ms, 0 = unlimited
 
 // defined in mini_racer_v8.cc
 void v8_global_init(void);
 struct State *v8_thread_init(struct Context *c, const uint8_t *snapshot_buf,
                              size_t snapshot_len, int64_t max_memory,
-                             int verbose_exceptions); // calls v8_thread_main
+                             int verbose_exceptions,
+                             const char *inspector_title); // calls v8_thread_main
 void v8_attach(struct State *pst, const uint8_t *p, size_t n);
 void v8_call(struct State *pst, const uint8_t *p, size_t n);
 void v8_call_await(struct State *pst, const uint8_t *p, size_t n);
@@ -59,6 +64,19 @@ void v8_cancel_watchdog_termination(struct State *pst); // called from v8 thread
 void v8_cancel_terminate_execution(struct State *pst); // called from ruby thread
 void v8_single_threaded_enter(struct State *pst, struct Context *c, void (*f)(struct Context *c));
 void v8_single_threaded_dispose(struct State *pst);
+// Chrome DevTools Protocol support; see mini_racer_inspector.h
+enum
+{
+    INSPECTOR_ENABLED  = 1,
+    INSPECTOR_ATTACHED = 2, // a frontend is connected
+    INSPECTOR_READY    = 4, // the frontend sent Runtime.runIfWaitingForDebugger
+};
+void v8_inspector_dispatch(struct State *pst); // v8 thread, while idle
+void v8_inspector_shutdown(struct State *pst); // v8 thread, without Context.mtx
+int v8_inspector_status(struct State *pst);
+void v8_inspector_break_next(struct State *pst);
+int v8_inspector_start(const char *host, int port, const char *token, char *err, size_t errlen);
+int v8_inspector_port(void);
 
 #ifdef __cplusplus
 }

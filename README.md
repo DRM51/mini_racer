@@ -143,6 +143,76 @@ context.eval("bar()", filename: "a/bar.js")
 # …
 ```
 
+### Remote Debugging with Chrome DevTools
+
+Contexts created with `inspector:` can be debugged with Chrome DevTools (or any
+client of the Chrome DevTools Protocol, such as VS Code): breakpoints, stepping,
+inspecting variables, the console and `debugger;` statements all work.
+
+```ruby
+MiniRacer::Inspector.start                      # 127.0.0.1:9229; port: 0 picks a free port
+context = MiniRacer::Context.new(inspector: "my transform")
+
+context.wait_for_debugger(timeout: 60)          # optional: block until DevTools attaches,
+                                                # then pause on the first statement
+context.eval(source, filename: "transforms/my_transform.js")
+```
+
+Open `chrome://inspect` in Chrome; contexts appear under *Remote Target* (add
+`localhost:9229` under *Configure…* if you use another port). Give `eval` a
+`filename:` so scripts show up under a recognisable name in the Sources panel.
+
+- One server per process. Each inspectable context is a separate target named
+  after its `inspector:` value (`inspector: true` uses `"mini_racer"`), and
+  disappears when the context is disposed. One frontend can attach to a target
+  at a time.
+- Time spent paused at a breakpoint does not count against `timeout:`.
+  `Context#stop` and `#dispose` still work while paused. A single pause is
+  capped by `max_pause:` (milliseconds, default 10 minutes, `0` for no cap):
+  past it the script is terminated with `MiniRacer::ScriptTerminatedError`, so
+  a forgotten breakpoint cannot hold a request thread forever.
+- An inspectable context keeps the arguments of its last 1000 `console.*` calls
+  alive (DevTools replays them on attach), attached or not. Scripts that log
+  large objects should enable `inspector:` only while debugging, or replace
+  `console`.
+- Attached Ruby functions can be called from the DevTools console while the
+  context is paused at a breakpoint. While the context is idle (no `eval` or
+  `call` in progress) the console works, but calling an attached Ruby function
+  raises an error, because no Ruby thread is waiting to run it.
+- `Context#debugger_attached?` tells whether a frontend is connected.
+- Not available in `:single_threaded` mode or on TruffleRuby.
+- With a forking server, start the inspector after forking, on a different
+  port per worker; a child never sees its parent's contexts. With Puma:
+
+  ```ruby
+  on_worker_boot do |index|
+    MiniRacer::Inspector.start(port: 9229 + 1 + index)
+    Rails.logger.info "mini_racer inspector: #{MiniRacer::Inspector.url}"
+  rescue RuntimeError => e # port still held by an old worker, etc.
+    Rails.logger.warn "mini_racer inspector not started: #{e.message}"
+  end
+  ```
+
+**Security:** anyone who can connect to the inspector port can run arbitrary
+code in your process. Keep the default `127.0.0.1` host and reach a remote
+machine through an SSH tunnel (`ssh -L 9229:localhost:9229 server`);
+`Inspector.start` refuses other addresses unless given `allow_remote: true`.
+The server rejects HTTP requests whose `Host` header is not `localhost` or an
+IP address (DNS rebinding), WebSocket connections from web page origins, and
+anything but a strict WebSocket handshake (so an SSRF-able HTTP client can't
+smuggle protocol messages).
+
+Loopback is still shared with every other process on the machine (or pod).
+`Inspector.start(token: true)` puts a random token in front of every URL,
+`/json/list` included, so only someone given `Inspector.url` can find a
+context; `chrome://inspect` can't discover such targets, so open the
+`devtoolsFrontendUrl` from that list directly. Use a token anywhere other than
+your own machine.
+
+In production, prefer debugging outside the request path (a console or runner
+process replaying one job) over Puma workers, keep `max_pause:` short (say
+60–120 seconds) and always pass `wait_for_debugger` a `timeout:`.
+
 ### Fork Safety
 
 Some Ruby web servers employ forking (for example unicorn or puma in clustered mode). V8 is not fork safe by default and sadly Ruby does not have support for fork notifications per [#5446](https://bugs.ruby-lang.org/issues/5446).

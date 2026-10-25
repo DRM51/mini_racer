@@ -1,6 +1,6 @@
 require 'mkmf'
 
-$srcs = ["mini_racer_extension.c", "mini_racer_v8.cc"]
+$srcs = ["mini_racer_extension.c", "mini_racer_v8.cc", "mini_racer_inspector.cc"]
 
 if RUBY_ENGINE == "truffleruby"
   File.write("Makefile", dummy_makefile($srcdir).join(""))
