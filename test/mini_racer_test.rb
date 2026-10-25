@@ -2380,6 +2380,71 @@ class MiniRacerTest < Minitest::Test
     assert_equal actual, expected
   end
 
+  def test_object_ref_identity_in_js
+    context = MiniRacer::Context.new
+    context.eval(<<~JS)
+      function f(o) {
+        return [o.a === o.b, o.c === o.d, o.e === o.f, o.g[0] === o.g]
+      }
+    JS
+    shared = { "x" => 42 }
+    list = [1, 2]
+    cyclic = []
+    cyclic << cyclic
+    arg = {
+      "a" => shared, "b" => shared,
+      "c" => { "x" => 42 }, "d" => { "x" => 42 }, # equal but distinct
+      "e" => list, "f" => list,
+      "g" => cyclic,
+    }
+    assert_equal [true, false, true, true], context.call("f", arg)
+  end
+
+  def test_latin1_strings_from_js
+    context = MiniRacer::Context.new
+    # V8 stores these as one-byte (latin1) strings
+    all = (0x80..0xff).map { |i| i.chr.force_encoding("ISO-8859-1").encode("UTF-8") }.join
+    actual = context.eval(<<~JS)
+      let s = ""
+      for (let i = 0x80; i <= 0xff; i++) s += String.fromCharCode(i)
+      ;["café", "ÿ", "plain", "", s]
+    JS
+    assert_equal ["café", "ÿ", "plain", "", all], actual
+    actual.each do |v|
+      assert_equal Encoding::UTF_8, v.encoding
+      assert v.valid_encoding?
+    end
+  end
+
+  def test_strings_to_js
+    context = MiniRacer::Context.new
+    context.eval("function f(s) { return [s, s.length] }")
+    assert_equal ["ascii", 5], context.call("f", "ascii")
+    assert_equal ["héllo", 5], context.call("f", "héllo")
+    assert_equal ["日本 😀", 5], context.call("f", "日本 😀")
+    assert_equal ["ok", 2], context.call("f", "ok".encode("US-ASCII"))
+    assert_equal ["ok", 2], context.call("f", "ok".b)
+  end
+
+  def test_object_keys_from_js
+    context = MiniRacer::Context.new
+    actual = context.eval(<<~JS)
+      [{ id: 1, "café": 2, 3: 4 }, { id: 5, "café": 6, 3: 7 }]
+    JS
+    assert_equal [{ "3" => 4, "id" => 1, "café" => 2 },
+                  { "3" => 7, "id" => 5, "café" => 6 }], actual
+    actual.each do |h|
+      h.each_key do |k|
+        assert_instance_of String, k
+        assert k.frozen?
+        assert k.valid_encoding?
+      end
+    end
+    # keys are frozen but the hashes are not
+    actual[0]["new"] = 1
+    assert_equal 1, actual[0]["new"]
+  end
+
   def test_termination_exception
     context = MiniRacer::Context.new
     a = Thread.new { context.stop while true }

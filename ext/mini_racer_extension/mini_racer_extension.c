@@ -273,8 +273,12 @@ static void put(DesCtx *c, VALUE v)
         if (*b == Qundef) {
             *b = v;
         } else {
-            if (!c->tos->verbatim_keys)
-                *b = rb_funcall(*b, rb_intern("to_s"), 0);
+            if (!c->tos->verbatim_keys) {
+                if (RB_TYPE_P(*b, T_STRING))
+                    *b = rb_str_to_interned_str(*b);
+                else
+                    *b = rb_funcall(*b, rb_intern("to_s"), 0);
+            }
             rb_hash_aset(*a, *b, v);
             *b = Qundef;
         }
@@ -400,21 +404,33 @@ static VALUE str_encode_bang(VALUE v)
 
 static void des_string8(void *arg, const uint8_t *s, size_t n)
 {
-    rb_encoding *e;
+    size_t i, hi;
     DesCtx *c;
     VALUE v;
+    char *d;
 
     c = arg;
     if (*c->err)
         return;
     if (c->transcode_latin1) {
-        e = rb_enc_find("ISO-8859-1"); // TODO cache?
-        if (!e) {
-            snprintf(c->err, sizeof(c->err), "no ISO-8859-1 encoding");
-            return;
+        // latin1 -> utf8 without a round trip through String#encode!
+        for (hi = 0, i = 0; i < n; i++)
+            hi += s[i] >> 7;
+        if (!hi) {
+            v = rb_utf8_str_new((char *)s, n);
+        } else {
+            // every byte >= 0x80 becomes two bytes
+            v = rb_utf8_str_new(NULL, n + hi);
+            d = RSTRING_PTR(v);
+            for (i = 0; i < n; i++) {
+                if (s[i] < 0x80) {
+                    *d++ = s[i];
+                } else {
+                    *d++ = 0xC0 | (s[i] >> 6);
+                    *d++ = 0x80 | (s[i] & 0x3F);
+                }
+            }
         }
-        v = rb_enc_str_new((char *)s, n, e);
-        v = str_encode_bang(v); // cannot fail
     } else {
         v = rb_enc_str_new((char *)s, n, rb_ascii8bit_encoding());
     }
@@ -581,6 +597,9 @@ static void add_string(Ser *s, VALUE v)
         if (!strcmp(e->name, "UTF-16LE"))
             return ser_string16(s, p, n);
     }
+    // ASCII is valid latin1: V8 builds a one-byte string without decoding
+    if (e && rb_enc_asciicompat(e) && rb_enc_str_coderange(v) == ENC_CODERANGE_7BIT)
+        return ser_string8(s, p, n);
     return ser_string(s, p, n);
 }
 
@@ -628,12 +647,11 @@ static int serialize1(Ser *s, VALUE refs, VALUE v, int depth)
     switch (TYPE(v)) {
     case T_ARRAY:
         {
-            VALUE obj_id = rb_obj_id(v);
-            id = rb_hash_lookup(refs, obj_id);
+            id = rb_hash_lookup(refs, v);
             if (NIL_P(id)) {
                 n = RARRAY_LENINT(v);
                 i = rb_hash_size_num(refs);
-                rb_hash_aset(refs, obj_id, LONG2FIX(i));
+                rb_hash_aset(refs, v, LONG2FIX(i));
                 ser_array_begin(s, n);
                 for (i = 0; i < n; i++)
                     if (serialize1(s, refs, rb_ary_entry(v, i), depth + 1))
@@ -646,13 +664,12 @@ static int serialize1(Ser *s, VALUE refs, VALUE v, int depth)
         break;
     case T_HASH:
         {
-            VALUE obj_id = rb_obj_id(v);
-            id = rb_hash_lookup(refs, obj_id);
+            id = rb_hash_lookup(refs, v);
             if (NIL_P(id)) {
                 a = rb_ary_new();
                 i = rb_hash_size_num(refs);
                 n = rb_hash_size_num(v);
-                rb_hash_aset(refs, obj_id, LONG2FIX(i));
+                rb_hash_aset(refs, v, LONG2FIX(i));
                 rb_hash_foreach(v, collect, a);
                 for (i = 0; i < 2*n; i += 2) {
                     t = rb_ary_entry(a, i);
@@ -760,7 +777,10 @@ static int serialize1(Ser *s, VALUE refs, VALUE v, int depth)
 // that will throw off the object reference count
 static int serialize(Ser *s, VALUE v)
 {
-    return serialize1(s, rb_hash_new(), v, 0);
+    VALUE refs = rb_hash_new();
+    // keyed by the object itself; rb_obj_id would pin an id on every one
+    rb_funcall(refs, rb_intern("compare_by_identity"), 0);
+    return serialize1(s, refs, v, 0);
 }
 
 static struct timespec deadline_ms(int ms)
