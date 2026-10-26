@@ -2775,6 +2775,23 @@ class MiniRacerTest < Minitest::Test
     assert_equal "after: 2", lines[4]
   end
 
+  def test_throw_from_a_callback_becomes_an_error
+    context = MiniRacer::Context.new
+    context.attach("thrower", -> { throw :out })
+    result =
+      catch(:out) do
+        context.eval("thrower()")
+        :not_thrown
+      end
+    flunk "the throw reached the catch: #{result.inspect}"
+  rescue MiniRacer::RuntimeError, ::RuntimeError => e
+    assert_includes e.message, "can't reach a catch"
+    assert_equal 2, context.eval("1 + 1")
+    # caught inside the callback, a throw is fine
+    context.attach("inner", -> { catch(:x) { throw :x, 5 } })
+    assert_equal 5, context.eval("inner()")
+  end
+
   def test_max_memory_bounds_array_buffers
     context = MiniRacer::Context.new(max_memory: 64 << 20)
     # one buffer over the limit, and many that together are

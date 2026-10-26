@@ -1413,9 +1413,18 @@ static VALUE callback_exception_from_state(int state, int *pending_jump_tag)
         rb_obj_is_kind_of(exception, rb_eException)) {
         return exception;
     }
-    // Thread#kill and other non-exception jumps leave a sentinel or internal
-    // throw data in errinfo; do not hand that to rb_funcall/rb_exc_raise.
-    // Replay the jump once the V8 roundtrip has fully unwound.
+    // A throw (Kernel#throw to a catch outside the eval or call) carries VM
+    // throw data in errinfo, cleared above and needed by the catch: replayed
+    // later it crashed in the catch (and hung upstream). It can't be
+    // re-thrown without Ruby internals, so it becomes an exception here.
+    // 7 is the VM's TAG_THROW, which has no public name.
+    if (state == 7)
+        return rb_exc_new_cstr(rb_eRuntimeError,
+                               "throw from a Ruby callback can't reach a catch "
+                               "outside the JavaScript call; raise an exception instead");
+    // Thread#kill and other non-exception jumps leave a sentinel in errinfo;
+    // do not hand that to rb_funcall/rb_exc_raise. Replay the jump once the
+    // V8 roundtrip has fully unwound.
     if (state && pending_jump_tag && !*pending_jump_tag)
         *pending_jump_tag = state;
     return Qnil;
