@@ -1,3 +1,13 @@
+- 0.22.2.15 - 26-10-2026
+  - DRM51 build: 0.22.2.14 plus the changes below
+  - Inspector replies and events go only to the frontend the V8 thread is serving: one that attaches while the last one's commands are still queued no longer receives their replies or the console entries they replayed
+  - An attach error is held to `max_value_size` like other script values (a getter on the attach path could make it any size)
+  - `Context#call` frees its request when a Ruby conversion raises
+  - A frontend that sends message after message is no longer dropped at `handshake_timeout`
+  - `decimal: :string` switches to scientific form at more than 1000 digits before or after the point, counted from the significant digits
+  - `capture_on_throw` expressions move to an outer frame only when the name is really unbound in the inner one
+  - Stricter inspector parsing: control characters in header values, HTTP/1.1 without Host, non-minimal WebSocket lengths and malformed close frames are refused
+
 - 0.22.2.14 - 26-10-2026
   - DRM51 build: 0.22.2.13 plus the changes below
   - Add `Context.new(decimal: :string)`, which passes a `BigDecimal` as its exact digits (`"12345678901234567890.5"`) where `:float` keeps about 15 significant digits
