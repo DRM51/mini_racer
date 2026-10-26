@@ -431,10 +431,21 @@ void reply_retry(State& st, v8::Local<v8::Value> response)
     v8::TryCatch try_catch(st.isolate);
     try_catch.SetVerbose(st.verbose_exceptions);
     bool ok = reply(st, response);
+    bool fallback = false;
     while (!ok) {
         assert(try_catch.HasCaught());
-        assert(try_catch.HasTerminated());
-        if (!try_catch.HasTerminated()) abort();
+        if (!try_catch.HasTerminated()) {
+            // the response itself can't be sent (too large for v8_reply,
+            // or out of memory): send a short internal error instead
+            if (fallback) abort(); // not even that fits
+            fallback = true;
+            try_catch.Reset();
+            std::vector<char> buf;
+            set_error_message(buf, INTERNAL_ERROR, "reply could not be returned to Ruby");
+            response = string_from_bytes(st.isolate, buf);
+            ok = reply(st, response);
+            continue;
+        }
         st.isolate->CancelTerminateExecution();
         ok = reply(st, response);
         st.isolate->TerminateExecution();
