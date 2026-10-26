@@ -2775,4 +2775,31 @@ class MiniRacerTest < Minitest::Test
     assert_equal "after: 2", lines[4]
   end
 
+  def test_max_memory_bounds_array_buffers
+    context = MiniRacer::Context.new(max_memory: 64 << 20)
+    # one buffer over the limit, and many that together are
+    error =
+      assert_raises(MiniRacer::RuntimeError) do
+        context.eval("new ArrayBuffer(1 << 30)")
+      end
+    assert_includes error.message, "Array buffer allocation failed"
+    error =
+      assert_raises(MiniRacer::RuntimeError) do
+        context.eval(<<~JS)
+          const keep = []
+          for (let i = 0; i < 100; i++) keep.push(new Uint8Array(8 << 20))
+        JS
+      end
+    assert_includes error.message, "Array buffer allocation failed"
+    # buffers that die are collected rather than counted
+    assert_equal 2000 * (4 << 20),
+                 context.eval(<<~JS)
+                   let total = 0
+                   for (let i = 0; i < 2000; i++) total += new Uint8Array(4 << 20).length
+                   total
+                 JS
+    # without max_memory nothing changes
+    assert_equal 256 << 20,
+                 MiniRacer::Context.new.eval("new ArrayBuffer(256 << 20).byteLength")
+  end
 end
