@@ -2827,6 +2827,29 @@ class MiniRacerTest < Minitest::Test
     assert MiniRacer::Context.new.eval("new ArrayBuffer(8, { maxByteLength: 64 }).resizable")
   end
 
+  def test_the_resizable_buffer_guard_reads_options_once
+    context = MiniRacer::Context.new(max_memory: 64 << 20)
+    # a getter that says "not resizable" to the check and 1 GiB to V8
+    assert_equal [false, 8, 1],
+                 context.eval(<<~JS)
+                   let reads = 0
+                   const opts = {}
+                   Object.defineProperty(opts, "maxByteLength", {
+                     get() { reads++; return reads === 1 ? undefined : 1 << 30 }
+                   })
+                   const b = new ArrayBuffer(8, opts)
+                   ;[b.resizable, b.byteLength, reads]
+                 JS
+    # the length's valueOf adding maxByteLength after the check
+    assert_equal [false, 8],
+                 context.eval(<<~JS)
+                   const late = {}
+                   const length = { valueOf() { late.maxByteLength = 1 << 30; return 8 } }
+                   const c = new SharedArrayBuffer(length, late)
+                   ;[c.growable, c.byteLength]
+                 JS
+  end
+
   def test_max_memory_counts_heap_and_buffers_together
     context = MiniRacer::Context.new(max_memory: 64 << 20)
     # 56 MB of buffers, then a heap that only goes over the limit with them

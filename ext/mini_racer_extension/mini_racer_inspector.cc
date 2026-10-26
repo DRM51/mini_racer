@@ -897,8 +897,9 @@ bool stop_server()
         std::lock_guard<std::mutex> lock(g_mu);
         if (g_port < 0 || !g_thread_running)
             return false;
-        g_port = -1; // new connections are refused from here on
-        g_prefix.clear();
+        g_port = -1; // reported as stopped from here on
+        // g_prefix stays until the thread has exited: a request it is still
+        // answering must keep being checked against the token
         thr = g_thread;
         wake_w = g_wake_w;
         // the server thread closes g_lfd and g_wake_r itself
@@ -910,6 +911,7 @@ bool stop_server()
     close(wake_w);
     std::lock_guard<std::mutex> lock(g_mu);
     g_thread_running = false;
+    g_prefix.clear();
     return true;
 }
 

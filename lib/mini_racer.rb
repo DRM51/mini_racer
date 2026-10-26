@@ -389,9 +389,15 @@ module MiniRacer
       settings = DEFAULT_SETTINGS.merge(given)
       settings.each do |k, v|
         next if k == :max_targets && v.nil?
-        unless v.is_a?(Numeric) && v.positive? && v <= (k.end_with?("timeout") ? 86_400 : 1 << 40)
-          raise ArgumentError, "bad inspector setting #{k}: #{v.inspect}"
-        end
+        # counts and sizes are whole numbers (0.5 would truncate to 0, which
+        # natively means no cap); timeouts are seconds and may be fractional
+        ok =
+          if k.end_with?("timeout")
+            v.is_a?(Numeric) && v.positive? && v <= 86_400
+          else
+            v.is_a?(Integer) && v.positive? && v <= 1 << 40
+          end
+        raise ArgumentError, "bad inspector setting #{k}: #{v.inspect}" unless ok
       end
       settings.freeze
     end

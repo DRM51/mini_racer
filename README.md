@@ -154,8 +154,10 @@ at the last garbage collection plus all live buffers past the limit fails
 with a `RangeError` ("Array buffer allocation failed") that the script can
 catch, after V8 has collected garbage and retried. A heap that grows past
 the limit together with the buffers already held ends the script with
-`V8OutOfMemoryError` (after two full garbage collections in a row find it
-over, since dead buffers are freed just after one).
+`V8OutOfMemoryError` once two full garbage collections in a row find it
+over (dead buffers are freed just after one). That check is soft: between
+full collections, or in a script that ends before a second one, heap plus
+buffers can briefly exceed the limit.
 
 Resizable ArrayBuffers and growable SharedArrayBuffers (`new ArrayBuffer(n,
 {maxByteLength})`) take memory V8 doesn't let mini_racer count, so with

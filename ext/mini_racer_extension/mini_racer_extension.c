@@ -1415,7 +1415,8 @@ static VALUE callback_exception_from_state(int state, int *pending_jump_tag)
     // throw data in errinfo, cleared above and needed by the catch: replayed
     // later it crashed in the catch (and hung upstream). It can't be
     // re-thrown without Ruby internals, so it becomes an exception here.
-    // 7 is the VM's TAG_THROW, which has no public name.
+    // 7 is CRuby's TAG_THROW (vm_core.h), private but unchanged since 1.9;
+    // there's no public name for it. Other Rubies don't use this file.
     if (state == 7)
         return rb_exc_new_cstr(rb_eRuntimeError,
                                "throw from a Ruby callback can't reach a catch "
