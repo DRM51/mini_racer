@@ -587,6 +587,8 @@ class MiniRacerInspectorTest < Minitest::Test
     assert_raises(ArgumentError) { MiniRacer::Inspector.start(port: 0, max_connections: 5) }
     assert_raises(ArgumentError) { MiniRacer::Inspector.start(port: 0, token: "late") }
     assert_raises(ArgumentError) { MiniRacer::Inspector.start(port: 0, frobnicate: 1) }
+    # 0.5 would truncate to 0, which natively means no cap
+    assert_raises(ArgumentError) { MiniRacer::Inspector.start(port: 0, max_targets: 0.5) }
     endpoint = MiniRacer::Inspector.endpoint
     assert_equal({ host: "127.0.0.1", port: @port, pid: Process.pid },
                  endpoint.slice(:host, :port, :pid))

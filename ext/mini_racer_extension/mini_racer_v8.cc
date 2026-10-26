@@ -33,7 +33,8 @@
 // refused instead. Every way to the constructors goes through globalThis
 // or a prototype's constructor property, both replaced here, and the trap
 // keeps its own Reflect.construct, so later changes to globals can't
-// bypass it.
+// bypass it. A resizable buffer can't exist in such a context, so resize()
+// and grow(), whose memory the budget can't see either, never apply.
 static const char resizable_buffer_guard_source[] = R"js(
 (() => {
   'use strict';
@@ -42,12 +43,16 @@ static const char resizable_buffer_guard_source[] = R"js(
   const guard = (C, name) => {
     if (typeof C !== 'function') return;
     const guarded = new Proxy(C, {
+      // The caller's options object never reaches V8: maxByteLength is
+      // read once here, and V8 gets only the length, so a getter can't
+      // answer differently when V8 reads it again. maxByteLength is the
+      // only option these constructors take.
       construct(target, args, newTarget) {
         const options = args[1];
         if (options !== null && (typeof options === 'object' || typeof options === 'function') &&
             options.maxByteLength !== undefined)
           throw new RangeError(`resizable ${name}s aren't available with max_memory`);
-        return construct(target, args, newTarget);
+        return construct(target, [args[0]], newTarget);
       },
     });
     define(globalThis, name, {value: guarded, writable: true, configurable: true, enumerable: false});
