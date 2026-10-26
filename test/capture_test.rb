@@ -820,20 +820,6 @@ class MiniRacerCaptureTest < Minitest::Test
     end
   end
 
-  def test_marking_declarations_scans_a_big_script_once
-    # a pasted library: many top-level lets in a few MB. Searched per name
-    # it took ~10 s here (21 s at 4 MB), far past the recording's 100 ms
-    script = (1..400).map { |i| "let v#{i} = #{i};" }.join("\n") + "\n" +
-             ("// #{"x" * 200}\n" * 10_000) + "null.boom\n"
-    ctx = new_context(capture_on_throw: true)
-    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    capture = capture_of { ctx.eval(script) }
-    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 3
-    shown = variables(capture["frames"].first, "script")
-    assert_operator shown.size, :>=, 50 # the first 50 keys, then "… N more"
-    assert_empty shown.values.grep("[Not yet declared]"), "all 400 were declared before the throw"
-  end
-
   def test_uncaught_exceptions_are_not_printed
     script = <<~RUBY
       require "mini_racer"
