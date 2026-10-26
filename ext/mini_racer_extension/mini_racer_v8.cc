@@ -1061,15 +1061,20 @@ void InspectorClient::runMessageLoopOnPause(int)
             request_termination(&st, NON_WATCHDOG_TERMINATION);
             break;
         }
-        if (inspector_drain(in))
-            continue;
+        // a batch at a time, with the checks below after every batch, so
+        // steady traffic can't hold off max_pause, quit or a stop
+        constexpr size_t kPauseBatch = 64;
+        size_t ran = inspector_drain(in, kPauseBatch);
+        if (in.quit_pause)
+            break;
         if (in.disconnect_pending) // the frontend left; its pause is over
             break;
         // Context#stop, dispose or a vanished frontend end the pause; V8
         // then resumes and the pending termination, if any, takes over
         if (st.terminate_requested.load() || v8_context_quitting(st.ruby_context) || !in.session)
             break;
-        mri::wait(*in.target, 100);
+        if (!ran)
+            mri::wait(*in.target, 100);
     }
     in.paused = false;
     v8_inspector_paused(st.ruby_context, 0);
@@ -1079,16 +1084,16 @@ void inspector_interrupt(v8::Isolate *, void *arg)
 {
     State& st = *static_cast<State*>(arg);
     Inspector *in = st.inspector.get();
-    // a pause loop or a dispatch further up the stack drains instead.
-    // Inside an eval, a batch at a time: the eval's own JavaScript runs
-    // between batches, so a frontend's backlog can't hold it up for as long
-    // as the backlog takes, and the interrupt is asked for again for the rest.
-    // (What the batch runs counts against the eval's timeout: the frontend
-    // is debugging that eval.)
-    constexpr size_t kInterruptBatch = 8;
-    if (in && !in->paused && in->dispatch_depth == 0 &&
-        inspector_drain(*in, kInterruptBatch) == kInterruptBatch)
-        st.isolate->RequestInterrupt(inspector_interrupt, &st);
+    // A pause loop or a dispatch further up the stack drains instead.
+    // Inside an eval this runs every queued command before the eval's
+    // JavaScript resumes, and their time counts against the eval's timeout:
+    // a frontend can delay the eval it is debugging, and that eval's
+    // watchdog (or the caller's own deadline) bounds it. Draining a batch
+    // and asking for the interrupt again wouldn't help: V8 runs interrupts
+    // requested from an interrupt callback in the same loop, before any
+    // JavaScript (Codex, 2026-10-26).
+    if (in && !in->paused && in->dispatch_depth == 0)
+        inspector_drain(*in);
 }
 
 // Runs on the v8 thread when it's blocked in await_promise(), where an
