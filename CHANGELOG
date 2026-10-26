@@ -1,3 +1,10 @@
+- 14.6.202.34.3 - 26-10-2026
+  - Values passed between Ruby and JavaScript are limited to 1 GiB serialized; larger ones raise `MiniRacer::RuntimeError` ("serialized value too large (over 1 GiB)", or "RangeError: value too large to return to Ruby" from JavaScript)
+  - `max_memory:` now also counts ArrayBuffer and typed array memory; an allocation past the limit throws a catchable `RangeError` ("Array buffer allocation failed"). The README lists what it still doesn't cover (WebAssembly memories, copies between Ruby and JavaScript)
+  - `decimal: :float` converts only BigDecimal itself, not subclasses
+  - capture_on_throw: the 100 ms deadline starts at the pause, at most 20 scopes are recorded per frame, integer keys past 50 aren't enumerated, and only the innermost 10 frames of V8's pause message are parsed (a throw thousands of frames deep now gets a capture)
+  - The same fixes ship for V8 13.6 as mini_racer 0.22.2.9
+
 - 14.6.202.34.2 - 25-10-2026
   - `capture_on_throw: {expressions: [...]}` evaluates up to 20 JavaScript expressions in the failing frame (or the next one out where their names are defined), in V8's side-effect-free mode with a 50 ms limit each, and records the results in `capture["expressions"]`
 
