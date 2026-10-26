@@ -363,14 +363,19 @@ end
   - each recorded exception: typically 0.2 ms, at most about 100 ms of
     recording. That includes a promise rejected while nothing handles it yet,
     even if a handler is added later;
-  - before recording starts, V8 describes every frame and scope of the stack.
-    A throw thousands of frames deep, especially with many top-level
-    `let`/`const`, can take a second or more, and neither the 100 ms limit
-    nor `timeout:` covers it. A pause V8 describes in over 16 MB of JSON
-    isn't recorded: a thrown string of a few million characters (six bytes
-    each when they aren't ASCII), say;
-  - an object with a million properties: about half a second, because V8
-    lists them all before 50 are kept.
+  - before recording starts, V8 describes every frame and scope of the stack,
+    and the thrown value in full. Neither the 100 ms limit, `timeout:` nor
+    `max_memory:` covers that: a throw 9,000 frames deep takes about 0.1–0.2 s
+    (only the innermost 10 frames are then parsed), more with many top-level
+    `let`/`const`, and a thrown 100-million-character string took 3 s and
+    1.5 GB of memory (0.7 s and 550 MB without capture). A pause V8 describes
+    in over 16 MB of JSON isn't recorded: a thrown string of a few million
+    characters (six bytes each when they aren't ASCII), say. Running out of
+    stack ("Maximum call stack size exceeded") isn't recorded at all;
+  - an object with a million named properties: about half a second, because
+    V8 lists them before 50 are kept. Integer keys are looked up one at a
+    time instead, so only the first 50 of them are shown.
+- At most 20 scopes are recorded per frame.
 
   This makes capture mode a good fit for re-running a failed script, and
   for editor and test runs. Measure it before turning it on for all

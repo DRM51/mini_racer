@@ -607,6 +607,54 @@ class MiniRacerCaptureTest < Minitest::Test
                     "capture off/on: #{reached}"
   end
 
+  def test_running_out_of_memory_with_capture_on_ends_gracefully
+    # max_memory's termination, not V8's fatal out-of-memory error
+    script = <<~RUBY
+      require "mini_racer"
+      ctx = MiniRacer::Context.new(capture_on_throw: true, max_memory: 64 << 20)
+      begin
+        ctx.eval("const keep = []; for (let i = 0; ; i++) keep.push({ i, s: 'x'.repeat(64) + i })")
+      rescue MiniRacer::V8OutOfMemoryError
+        puts "out of memory"
+      end
+      puts ctx.eval("1 + 1")
+    RUBY
+    lib = File.expand_path("../lib", __dir__)
+    out, err, status = Open3.capture3(RbConfig.ruby, "-I", lib, "-e", script)
+    assert status.success?, "child failed (#{status}): #{err}"
+    assert_equal ["out of memory", "2"], out.lines.map(&:chomp)
+  end
+
+  def test_large_array_like_objects_are_probed_not_listed
+    ctx = new_context
+    capture =
+      capture_of do
+        ctx.eval(<<~JS)
+          const big = { name: "rows" }
+          for (let i = 0; i < 1e6; i++) big[i] = i
+          throw new Error("x")
+        JS
+      end
+    big = variables(capture["frames"][0], "script")["big"]
+    assert_equal (0...50).map(&:to_s) + ["\u2026"], big.keys
+    assert_equal "more", big["\u2026"]
+    # integer keys stop at 50 without crowding out the named ones
+    small = capture_of { ctx.eval("const o = { 0: 'a', 1: 'b', name: 'c' }; throw o") }
+    assert_equal({ "0" => "a", "1" => "b", "name" => "c" },
+                 variables(small["frames"][0], "script")["o"])
+  end
+
+  def test_scopes_per_frame_are_bounded
+    ctx = new_context
+    depth = 60
+    source = (1..depth).map { |i| "(function f#{i}() { const v#{i} = #{i};" }.join
+    # using every outer variable keeps all 60 closure scopes in the chain
+    sum = (1..depth).map { |i| "v#{i}" }.join(" + ")
+    source += "throw new Error(String(#{sum}));" + ("})()" * depth)
+    capture = capture_of { ctx.eval(source) }
+    assert_equal 20, capture["frames"][0]["scopes"].size
+  end
+
   def test_uncaught_exceptions_are_not_printed
     script = <<~RUBY
       require "mini_racer"
