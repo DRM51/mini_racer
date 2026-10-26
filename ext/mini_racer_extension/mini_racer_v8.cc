@@ -965,11 +965,10 @@ bool inspector_drain(Inspector& in)
         // A frontend that attaches while the last one's command is still
         // being dispatched (it paused, and this is the pause loop) waits
         // until that unwinds: the command's reply then goes to no one, and
-        // the old V8 session is dropped rather than handed over.
-        if (in.disconnect_pending && in.dispatch_depth > 0 &&
-            mri::peek(*in.target) == mri::Event::Connect)
-            break;
-        mri::Event ev = mri::poll(*in.target, &msg);
+        // the old V8 session is dropped rather than handed over. poll()
+        // decides under the queue's lock, so a Connect queued meanwhile
+        // can't slip past.
+        mri::Event ev = mri::poll(*in.target, &msg, in.disconnect_pending && in.dispatch_depth > 0);
         if (ev == mri::Event::None)
             break;
         any = true;
@@ -1043,7 +1042,10 @@ bool inspector_drain(Inspector& in)
 
 void InspectorClient::runMessageLoopOnPause(int)
 {
-    if (in.paused)
+    // Not again for a frontend that has gone: its command, resumed when it
+    // left, carries on to the end, so the next frontend's Connect (held
+    // until then, see inspector_drain) isn't stranded behind a new pause.
+    if (in.paused || in.disconnect_pending)
         return;
     State& st = in.st;
     in.paused = true;
@@ -1061,6 +1063,8 @@ void InspectorClient::runMessageLoopOnPause(int)
         }
         if (inspector_drain(in))
             continue;
+        if (in.disconnect_pending) // the frontend left; its pause is over
+            break;
         // Context#stop, dispose or a vanished frontend end the pause; V8
         // then resumes and the pending termination, if any, takes over
         if (st.terminate_requested.load() || v8_context_quitting(st.ruby_context) || !in.session)
@@ -1787,10 +1791,18 @@ bool names_undefined_identifier(const std::string& error, const std::string& exp
         return false;
     std::string name = error.substr(prefix.size(), error.size() - prefix.size() - suffix.size());
     auto ident = [](unsigned char c) { return std::isalnum(c) || c == '_' || c == '$' || c >= 0x80; };
-    // a plain identifier, since capture_evaluate runs "typeof <name>": a
-    // thrown message like "f() is not defined" must not become a call
+    // a plain ASCII identifier, not a reserved word, since capture_evaluate
+    // runs "typeof <name>": a thrown "f() is not defined", or "new\u00a0F",
+    // must not become a call. A non-ASCII name gets no outer-frame retry.
+    static const char *const reserved[] = {
+        "await", "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete",
+        "do", "else", "enum", "export", "extends", "false", "finally", "for", "function", "if", "import",
+        "in", "instanceof", "let", "new", "null", "return", "static", "super", "switch", "this", "throw",
+        "true", "try", "typeof", "var", "void", "while", "with", "yield"};
+    auto ascii_ident = [](unsigned char c) { return std::isalnum(c) || c == '_' || c == '$'; };
     if (name.empty() || std::isdigit(static_cast<unsigned char>(name[0])) ||
-        !std::all_of(name.begin(), name.end(), ident))
+        !std::all_of(name.begin(), name.end(), ascii_ident) ||
+        std::any_of(std::begin(reserved), std::end(reserved), [&](const char *w) { return name == w; }))
         return false;
     for (size_t at = expression.find(name); at != std::string::npos; at = expression.find(name, at + 1)) {
         size_t end = at + name.size();
@@ -1811,7 +1823,7 @@ bool names_undefined_identifier(const std::string& error, const std::string& exp
 // |*missing| when a name wasn't defined there, so an outer frame can try.
 bool capture_evaluate(Capture& cap, CaptureWalk& walk, v8::Local<v8::Value> frame,
                       const std::string& expression, v8::Local<v8::Value> *value,
-                      std::string *error, bool *missing)
+                      std::string *error, bool *missing, bool probing = false)
 {
     State& st = cap.st;
     auto sc = st.safe_context;
@@ -1869,14 +1881,14 @@ bool capture_evaluate(Capture& cap, CaptureWalk& walk, v8::Local<v8::Value> fram
         auto class_name = get_field(sc, exception, "className");
         std::string name;
         *error = walk.utf8(walk.truncated(walk.str(line)));
-        if (class_name->IsString() && walk.utf8(class_name) == "ReferenceError" &&
+        if (!probing && class_name->IsString() && walk.utf8(class_name) == "ReferenceError" &&
             names_undefined_identifier(line, expression, &name)) {
             // and only when the name isn't bound here: typeof says
             // "undefined" for that, "function" for a fake() that threw it
             v8::Local<v8::Value> type;
             std::string ignored;
             bool unused;
-            *missing = capture_evaluate(cap, walk, frame, "typeof " + name, &type, &ignored, &unused) &&
+            *missing = capture_evaluate(cap, walk, frame, "typeof " + name, &type, &ignored, &unused, true) &&
                        type->IsString() && walk.utf8(type) == "undefined";
         }
         return false;

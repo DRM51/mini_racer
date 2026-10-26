@@ -726,6 +726,25 @@ class MiniRacerCaptureTest < Minitest::Test
     end
   end
 
+  def test_a_reference_error_naming_more_than_an_identifier_is_not_probed
+    # "new\u00a0F" is a call to F, and so is a name with a reserved word
+    expressions = Array.new(20) { |i| "new\u00a0F#{" " * i}" }
+    ctx = new_context(capture_on_throw: { expressions: expressions })
+    capture = capture_of do
+      ctx.eval(<<~JS)
+        function inner() {
+          function F() { throw new ReferenceError("new\u00a0F is not defined") }
+          throw new Error(typeof F)
+        }
+        inner()
+      JS
+    end
+    capture["expressions"].each do |entry|
+      assert_equal 0, entry["frame"], entry
+      assert_equal "ReferenceError: new\u00a0F is not defined", entry["error"]
+    end
+  end
+
   def test_uncaught_exceptions_are_not_printed
     script = <<~RUBY
       require "mini_racer"

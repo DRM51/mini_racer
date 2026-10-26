@@ -30,10 +30,10 @@ const std::string& target_id(const Target& t);
 // target sees Event::Disconnect as usual. False if there's no such target.
 bool disconnect(const std::string& id);
 
-// Pops the next frontend event; *msg is set for Event::Message.
-Event poll(Target& t, std::string *msg);
-// The next event's kind, left queued.
-Event peek(Target& t);
+// Pops the next frontend event; *msg is set for Event::Message. With
+// |hold_connect|, a Connect at the front stays queued and None is returned,
+// decided under the same lock as the pop.
+Event poll(Target& t, std::string *msg, bool hold_connect = false);
 // Blocks for at most |ms| milliseconds or until an event or notify().
 void wait(Target& t, int ms);
 void notify(Target& t);

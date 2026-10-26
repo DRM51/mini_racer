@@ -59,7 +59,9 @@ struct Conn
 {
     int fd;
     // names the connection in queued events and Target::session, which
-    // must not keep a closed connection (and its buffers) alive
+    // must not keep a closed connection (and its buffers) alive. Starts at
+    // 1, as 0 means none; 2^64 connections, the point of wrapping, can't
+    // happen at any real rate.
     const uint64_t id = g_next_conn_id.fetch_add(1);
     std::mutex wmu;       // serializes writes; guards |closed| and the queue
     bool closed = false;
@@ -1036,10 +1038,12 @@ bool disconnect(const std::string& id)
     return true;
 }
 
-Event poll(Target& t, std::string *msg)
+Event poll(Target& t, std::string *msg, bool hold_connect)
 {
     std::lock_guard<std::mutex> lock(t.mu);
     if (t.q.empty())
+        return Event::None;
+    if (hold_connect && std::get<0>(t.q.front()) == Event::Connect)
         return Event::None;
     auto ev = std::move(t.q.front());
     t.q.pop_front();
@@ -1051,12 +1055,6 @@ Event poll(Target& t, std::string *msg)
     if (msg)
         *msg = std::move(std::get<1>(ev));
     return std::get<0>(ev);
-}
-
-Event peek(Target& t)
-{
-    std::lock_guard<std::mutex> lock(t.mu);
-    return t.q.empty() ? Event::None : std::get<0>(t.q.front());
 }
 
 void wait(Target& t, int ms)

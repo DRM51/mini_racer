@@ -845,6 +845,46 @@ class MiniRacerInspectorTest < Minitest::Test
     assert status.success?, err
   end
 
+  def test_reconnecting_while_the_context_is_busy_is_refused_at_the_queue_cap
+    script = <<~'RUBY'
+      require "mini_racer"
+      require "socket"
+      require "securerandom"
+      port = MiniRacer::Inspector.start(port: 0, max_queued_messages: 4)
+      ctx = MiniRacer::Context.new(inspector: "cap")
+      ctx.attach("nap", -> { sleep 1.5; 1 })
+      id = ctx.inspector_target_id
+      upgrade = lambda do
+        sock = TCPSocket.new("127.0.0.1", port)
+        sock.write("GET /#{id} HTTP/1.1\r\nHost: 127.0.0.1:#{port}\r\nUpgrade: websocket\r\n" \
+                   "Connection: Upgrade\r\nSec-WebSocket-Key: #{SecureRandom.base64(16)}\r\n" \
+                   "Sec-WebSocket-Version: 13\r\n\r\n")
+        status = sock.gets.to_s
+        [sock, status]
+      end
+      th = Thread.new { ctx.eval("nap()") }
+      sleep 0.2 # V8 is in the Ruby callback: nothing queued is handled
+      statuses = []
+      8.times do
+        sock, status = upgrade.call
+        statuses << status[/ (\d{3}) /, 1]
+        sock.close
+        sleep 0.05 # let the server see the close before the next try
+      end
+      th.join
+      sleep 0.2
+      # the queue drained once V8 was free: attaching works again
+      sock, status = upgrade.call
+      sock.close
+      ok = statuses.include?("503") && statuses.count("101") <= 3 && status.include?(" 101 ")
+      warn statuses.inspect, status unless ok
+      exit!(ok ? 0 : 1)
+    RUBY
+    _, err, status =
+      Open3.capture3(RbConfig.ruby, "-I", File.expand_path("../lib", __dir__), "-e", script)
+    assert status.success?, err
+  end
+
   def test_pings_inside_a_stalled_fragmented_message_do_not_keep_it_alive
     script = <<~RUBY
       require "mini_racer"
@@ -986,6 +1026,41 @@ class MiniRacerInspectorTest < Minitest::Test
     second.command("Runtime.enable")
     assert_empty second.events.select { |m| [4242, 4243, -1].include?(m["id"]) }
     refute ctx.eval("1; false") # the context carries on
+  end
+
+  def test_a_second_breakpoint_in_the_last_frontends_command_does_not_lock_out_the_next
+    ctx = new_context(inspector: "second-pause")
+    first = attach_like_devtools("second-pause")
+    first.send_text(JSON.generate(id: 4242, method: "Runtime.evaluate",
+                                  params: { expression: "debugger; debugger; 'done'" }))
+    frame = first.wait_event("Debugger.paused")["callFrames"][0]["callFrameId"]
+    first.send_text(JSON.generate(id: 4243, method: "Debugger.evaluateOnCallFrame",
+                                  params: { callFrameId: frame, expression: "for (const t = Date.now(); Date.now() - t < 800;); 1" }))
+    sleep 0.1
+    first.close
+    @clients.delete(first)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+    begin
+      second = connect("second-pause")
+    rescue RuntimeError
+      raise if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+      sleep 0.01
+      retry
+    end
+    # the resumed command passes its second debugger statement without
+    # pausing for nobody, so the next frontend gets in
+    assert_equal 42, second.command("Runtime.evaluate", expression: "6 * 7")["result"]["value"]
+    assert_equal 2, ctx.eval("1 + 1")
+  end
+
+  def test_a_debugger_command_while_idle_is_held_to_the_timeout
+    ctx = new_context(inspector: "idle-timeout", timeout: 300)
+    client = connect("idle-timeout")
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    client.send_text(JSON.generate(id: 9, method: "Runtime.evaluate", params: { expression: "for (;;) {}" }))
+    client.wait_response(9, timeout: 5)
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 3
+    assert_equal 2, ctx.eval("1 + 1") # and the termination doesn't leak into the next eval
   end
 
   def test_stop_during_a_blocked_callback_and_a_pause

@@ -1009,6 +1009,16 @@ static void v8_timedwait(Context *c, const uint8_t *p, size_t n,
     c->wd.active = 0;
 }
 
+// A frontend's command while the context is idle (Runtime.evaluate from the
+// DevTools console, say) runs JavaScript too: hold it to timeout: like an
+// eval, paused time excluded, so it can't keep the V8 thread forever.
+static void inspector_dispatch_timed(struct State *pst, const uint8_t *p, size_t n)
+{
+    (void)p;
+    (void)n;
+    v8_inspector_dispatch(pst);
+}
+
 static void dispatch1(Context *c, const uint8_t *p, size_t n)
 {
     uint8_t b;
@@ -1084,7 +1094,7 @@ void v8_thread_main(Context *c, struct State *pst)
         if (c->inspector_pending) {
             c->inspector_pending = 0;
             pthread_mutex_unlock(&c->mtx);
-            v8_inspector_dispatch(c->pst);
+            v8_timedwait(c, NULL, 0, inspector_dispatch_timed);
             pthread_mutex_lock(&c->mtx);
             continue;
         }
