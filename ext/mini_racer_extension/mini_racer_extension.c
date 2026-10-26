@@ -711,8 +711,9 @@ static void add_decimal_string(Ser *s, VALUE v)
     long long n = NUM2LL(rb_funcall(v, rb_intern("n_significant_digits"), 0));
     VALUE t;
 
-    // e digits before the point (when positive), n - e after it
-    if (e > 1000 || n - e > 1000)
+    // e digits before the point (when positive), n - e after it; e is
+    // bounded first, as n - e overflows for e near LLONG_MIN
+    if (e > 1000 || e < -1000 || n - e > 1000)
         t = rb_funcall(v, rb_intern("to_s"), 0);
     else
         t = rb_funcall(v, rb_intern("to_s"), 1, rb_str_new_cstr("F"));
