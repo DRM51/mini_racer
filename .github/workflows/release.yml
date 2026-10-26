@@ -11,7 +11,29 @@ on:
 permissions: {}
 
 jobs:
+  # integration_tool runs in ruby:3.4.10-slim-trixie on x86_64: build and test
+  # the tagged commit there before releasing it
+  test-deployment-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: ruby:3.4.10-slim-trixie
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential git procps
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+      - name: Install gems
+        run: bundle install
+      - name: Compile
+        run: bundle exec rake compile
+      - name: Test
+        run: bundle exec rake test
+
   release:
+    needs: test-deployment-image
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -41,6 +63,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          notes=$(ruby -e 'print File.read("CHANGELOG")[/\A- #{Regexp.escape(ARGV[0])} .*?(?=^- |\z)/m].to_s' "${GITHUB_REF_NAME#v}")
+          # the build's line under the fork's summary, "  - 0.22.2.16: ..."
+          notes=$(ruby -e 'print File.read("CHANGELOG")[/^  - #{Regexp.escape(ARGV[0])}: .*$/].to_s.sub(/\A  - /, "")' "${GITHUB_REF_NAME#v}")
           gh release create "${GITHUB_REF_NAME}" pkg/*.gem pkg/SHA256SUMS \
             --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}" --notes "${notes:-See CHANGELOG}"
