@@ -1,9 +1,8 @@
 source 'https://rubygems.org'
 
-# libv8-node 26 (V8 14) builds aren't on rubygems.org yet; DRM51 publishes
-# them at drm51.github.io/gems
+# drm51_libv8_node is DRM51's V8 build, published at drm51.github.io/gems
 source 'https://drm51.github.io/gems' do
-  gem 'libv8-node', '~> 26.12.1.0'
+  gem 'drm51_libv8_node', '~> 14.6.202.34'
 end
 
 # Specify your gem's dependencies in mini_racer.gemspec

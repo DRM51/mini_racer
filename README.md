@@ -1,5 +1,20 @@
 # MiniRacer
 
+> **This is DRM51's fork, published as `drm51_mini_racer`**, not an upstream
+> mini_racer release. It embeds V8 14.6 (from Node 26) through
+> `drm51_libv8_node`; its versions are the V8 version plus a build number
+> (14.6.202.34.1). Install it from DRM51's gem source:
+>
+> ```ruby
+> source "https://drm51.github.io/gems" do
+>   gem "drm51_mini_racer", "~> 14.6.202.34"
+>   gem "drm51_libv8_node", "~> 14.6.202.34"
+> end
+> ```
+>
+> Code keeps `require "mini_racer"` and `MiniRacer`. Don't install it next to
+> upstream `mini_racer` or `libv8-node`; they provide the same files.
+
 [![Test](https://github.com/rubyjs/mini_racer/actions/workflows/ci.yml/badge.svg)](https://github.com/rubyjs/mini_racer/actions/workflows/ci.yml) ![Gem](https://img.shields.io/gem/v/mini_racer)
 
 Minimal, modern embedded V8 for Ruby.

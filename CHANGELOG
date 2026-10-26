@@ -1,3 +1,8 @@
+- 14.6.202.34.1 - 25-10-2026
+  - Renamed drm51_mini_racer, so DRM51's builds can't be mistaken for upstream mini_racer releases, and versioned on the V8 version it embeds (V8 14.6.202.34, then our build number). Same code as 0.22.2.8. Code still does `require "mini_racer"` and uses `MiniRacer`
+  - Depends on drm51_libv8_node ~> 14.6.202.34 (Node 26.12.1's V8), published at https://drm51.github.io/gems. drm51_mini_racer and drm51_libv8_node can't be installed alongside upstream mini_racer or libv8-node: they provide the same files
+  - Only this V8 14 line is released from here on; the V8 13.6 builds (0.22.2.1, .3, .5, .7) get no further releases
+
 - 0.22.2.8 - 25-10-2026
   - DRM51 build: 0.22.2.7 on V8 14.6 (Node 26). Requires libv8-node ~> 26.12.1.0, published at https://drm51.github.io/gems
   - capture_on_throw: a record attaches only to the error of the eval or call it was made in, and not at all when two records of that evaluation match the thrown value; long Symbol descriptions, function names and error messages are shortened before they are converted; long property names that shorten alike no longer overwrite each other

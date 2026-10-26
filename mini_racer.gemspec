@@ -4,24 +4,25 @@ $LOAD_PATH.unshift(lib) unless $LOAD_PATH.include?(lib)
 require "mini_racer/version"
 
 Gem::Specification.new do |spec|
-  spec.name = "mini_racer"
+  spec.name = "drm51_mini_racer"
   spec.version = MiniRacer::VERSION
   spec.authors = ["Sam Saffron"]
   spec.email = ["sam.saffron@gmail.com"]
 
-  spec.summary = "Minimal embedded v8 for Ruby"
-  spec.description = "Minimal embedded v8 engine for Ruby"
-  spec.homepage = "https://github.com/discourse/mini_racer"
+  spec.summary = "DRM51 build of mini_racer: embedded V8 for Ruby"
+  spec.description =
+    "DRM51's fork of mini_racer (based on mini_racer 0.22.2), on V8 " \
+    "#{MiniRacer::VERSION.split(".").first(4).join(".")}. Not an upstream " \
+    "mini_racer release; versions follow the V8 version."
+  spec.homepage = "https://github.com/DRM51/mini_racer"
   spec.license = "MIT"
 
   spec.metadata = {
-    "bug_tracker_uri" => "https://github.com/discourse/mini_racer/issues",
+    "bug_tracker_uri" => "https://github.com/DRM51/mini_racer/issues",
     "changelog_uri" =>
-      "https://github.com/discourse/mini_racer/blob/v#{spec.version}/CHANGELOG",
-    "documentation_uri" =>
-      "https://www.rubydoc.info/gems/mini_racer/#{spec.version}",
+      "https://github.com/DRM51/mini_racer/blob/v#{spec.version}/CHANGELOG",
     "source_code_uri" =>
-      "https://github.com/discourse/mini_racer/tree/v#{spec.version}"
+      "https://github.com/DRM51/mini_racer/tree/v#{spec.version}"
   }
 
   spec.files =
@@ -44,7 +45,7 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency "rubocop"
   spec.add_development_dependency "syntax_tree"
 
-  spec.add_dependency "libv8-node", MiniRacer::LIBV8_NODE_VERSION
+  spec.add_dependency "drm51_libv8_node", MiniRacer::LIBV8_NODE_VERSION
   spec.require_paths = %w[lib ext]
 
   spec.extensions = %w[

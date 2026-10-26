@@ -8,7 +8,7 @@ if RUBY_ENGINE == "truffleruby"
 end
 
 require_relative '../../lib/mini_racer/version'
-gem 'libv8-node', MiniRacer::LIBV8_NODE_VERSION
+gem 'drm51_libv8_node', MiniRacer::LIBV8_NODE_VERSION
 require 'libv8-node'
 
 IS_DARWIN = RUBY_PLATFORM =~ /darwin/

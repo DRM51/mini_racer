@@ -23,7 +23,9 @@ else
     require "mini_racer_loader"
     ext_filename = "mini_racer_extension.#{RbConfig::CONFIG["DLEXT"]}"
     ext_path =
-      Gem.loaded_specs["mini_racer"].require_paths.map do |p|
+      (Gem.loaded_specs["drm51_mini_racer"] || Gem.loaded_specs["mini_racer"])
+        .require_paths
+        .map do |p|
         (p = Pathname.new(p)).absolute? ? p : Pathname.new(__dir__).parent + p
       end
     ext_found = ext_path.map { |p| p + ext_filename }.find { |p| p.file? }
