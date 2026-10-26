@@ -997,6 +997,7 @@ constexpr int kCaptureMillis = 100;      // time spent recording per exception
 constexpr size_t kCaptureCollection = 10000; // larger Maps and Sets: just the size
 constexpr size_t kCaptureRecords = 8;    // pauses waiting for their error
 constexpr size_t kCapturePauseMessage = 16 << 20; // larger pauses aren't recorded
+constexpr uint32_t kCaptureScopes = 20;  // scopes per frame
 
 struct CaptureClient final : public v8_inspector::V8InspectorClient
 {
@@ -1050,6 +1051,39 @@ bool starts_with(const v8_inspector::StringView& v, const char *prefix)
     return true;
 }
 
+// Keeps the first |keep| entries of a Debugger.paused message's callFrames.
+// V8 lists every frame, thousands for a runaway recursion, and only the
+// innermost few are recorded; a linear scan is much cheaper than parsing
+// the rest. Leaves a message that doesn't start as V8's do alone.
+void keep_call_frames(std::string& m, int keep)
+{
+    static const char prefix[] = "{\"method\":\"Debugger.paused\",\"params\":{\"callFrames\":[";
+    const size_t n = sizeof(prefix) - 1;
+    if (m.compare(0, n, prefix) != 0) return;
+    size_t cut = std::string::npos;
+    int depth = 0, frames = 0;
+    bool in_string = false;
+    for (size_t i = n; i < m.size(); i++) {
+        char c = m[i];
+        if (in_string) {
+            if (c == '\\') i++;
+            else if (c == '"') in_string = false;
+            continue;
+        }
+        switch (c) {
+        case '"': in_string = true; break;
+        case '{': case '[': depth++; break;
+        case '}': case ']':
+            if (depth == 0) { // callFrames' closing bracket
+                if (cut != std::string::npos) m.erase(cut, i - cut);
+                return;
+            }
+            if (--depth == 0 && ++frames == keep) cut = i + 1;
+            break;
+        }
+    }
+}
+
 void CaptureChannel::sendNotification(std::unique_ptr<v8_inspector::StringBuffer> m)
 {
     // the rest (a scriptParsed for each compiled script) is dropped
@@ -1058,8 +1092,10 @@ void CaptureChannel::sendNotification(std::unique_ptr<v8_inspector::StringBuffer
     // string, thousands of frames); don't spend more parsing it
     auto v = m->string();
     if (v.length() <= kCapturePauseMessage &&
-        starts_with(v, "{\"method\":\"Debugger.paused\""))
+        starts_with(v, "{\"method\":\"Debugger.paused\"")) {
         cap.paused = to_utf8(v);
+        keep_call_frames(cap.paused, kCaptureFrames);
+    }
 }
 
 v8::Local<v8::Context> CaptureClient::ensureDefaultContextInGroup(int)
@@ -1160,9 +1196,10 @@ struct CaptureWalk
     std::chrono::steady_clock::time_point deadline;
     bool stopped = false;
 
-    CaptureWalk(State& st, v8::Local<v8::Context> context)
+    CaptureWalk(State& st, v8::Local<v8::Context> context,
+                std::chrono::steady_clock::time_point start)
         : st(st), context(context),
-          deadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(kCaptureMillis))
+          deadline(start + std::chrono::milliseconds(kCaptureMillis))
     {
         v8::Context::Scope scope(st.safe_context);
         for (auto& m : seen) m = v8::Map::New(st.isolate);
@@ -1172,8 +1209,14 @@ struct CaptureWalk
     // Context#stop): what's left is recorded as [...]
     bool exhausted()
     {
-        if (!stopped && (--budget < 0 ||
-                         st.terminate_requested.load() ||
+        if (--budget < 0) stopped = true;
+        return out_of_time();
+    }
+
+    // like exhausted() but without spending a value
+    bool out_of_time()
+    {
+        if (!stopped && (st.terminate_requested.load() ||
                          st.isolate->IsExecutionTerminating() ||
                          std::chrono::steady_clock::now() > deadline))
             stopped = true;
@@ -1420,18 +1463,41 @@ struct CaptureWalk
         return scope.Escape(out);
     }
 
-    // own enumerable string-keyed properties; a debugger scope object's
-    // properties are its variables
+    // own enumerable string-keyed properties, integer keys first as in JS;
+    // a debugger scope object's properties are its variables. Integer keys
+    // are probed one by one up to kCaptureItems: listing them would make a
+    // name for every element of a large array-like object, and later ones
+    // aren't shown. The other names are listed in full; they're the
+    // object's own, so the list is at most about the object's size.
     v8::Local<v8::Value> object(v8::Local<v8::Object> o, int depth)
     {
         v8::EscapableHandleScope scope(st.isolate);
         auto out = new_object();
         if (stopped) return scope.Escape(out); // out of room: don't list the keys
+        uint32_t kept = 0;
+        for (uint32_t j = 0; j <= kCaptureItems && !out_of_time(); j++) {
+            if (!o->HasRealIndexedProperty(context, j).FromMaybe(false)) continue;
+            if (kept == kCaptureItems) {
+                put(out, str("\xE2\x80\xA6"), str("more"));
+                return scope.Escape(out);
+            }
+            v8::Local<v8::Value> val;
+            v8::Local<v8::String> key;
+            bool accessor = false;
+            if (!v8::Integer::NewFromUnsigned(st.isolate, j)->ToString(context).ToLocal(&key) ||
+                !own_value(o, key, &val, &accessor))
+                continue;
+            put(out, key, accessor ? getter() : value(val, depth + 1));
+            kept++;
+        }
         v8::Local<v8::Array> names;
         auto filter = static_cast<v8::PropertyFilter>(v8::ONLY_ENUMERABLE | v8::SKIP_SYMBOLS);
-        if (!o->GetOwnPropertyNames(context, filter, v8::KeyConversionMode::kConvertToString).ToLocal(&names))
+        if (stopped ||
+            !o->GetPropertyNames(context, v8::KeyCollectionMode::kOwnOnly, filter,
+                                 v8::IndexFilter::kSkipIndices,
+                                 v8::KeyConversionMode::kConvertToString).ToLocal(&names))
             return scope.Escape(out);
-        uint32_t n = names->Length(), kept = 0;
+        uint32_t n = names->Length();
         for (uint32_t i = 0; i < n; i++) {
             v8::Local<v8::Value> name_v, val;
             if (!names->Get(context, i).ToLocal(&name_v) || !name_v->IsString()) continue;
@@ -1518,6 +1584,9 @@ void capture_record(Capture& cap, const std::string& message)
     // belongs to no evaluation's error
     if (st.replying_depth == st.javascript_call_depth)
         return;
+    // the clock starts at the pause: the stack trace and parsing the pause
+    // message count against the deadline too
+    auto start = std::chrono::steady_clock::now();
     v8::HandleScope handle_scope(st.isolate);
     v8::TryCatch try_catch(st.isolate); // best effort; never disturbs the exception
     // CDP leaves a frame's url empty and names scripts only in scriptParsed
@@ -1534,7 +1603,7 @@ void capture_record(Capture& cap, const std::string& message)
     }
     v8::Local<v8::Context> sc = st.safe_context;
     v8::Context::Scope context_scope(sc);
-    CaptureWalk walk(st, st.context);
+    CaptureWalk walk(st, st.context, start);
     v8::Local<v8::Value> parsed;
     if (!v8::JSON::Parse(sc, walk.str(message)).ToLocal(&parsed)) return;
     auto params = get_field(sc, parsed, "params");
@@ -1548,7 +1617,7 @@ void capture_record(Capture& cap, const std::string& message)
     auto frames = frames_v.As<v8::Array>();
     auto out_frames = walk.new_array();
     bool script_scope_done = false; // top-level let/const: the same in every frame
-    for (uint32_t i = 0, n = frames->Length(); i < n && i < kCaptureFrames; i++) {
+    for (uint32_t i = 0, n = frames->Length(); i < n && i < kCaptureFrames && !walk.out_of_time(); i++) {
         v8::Local<v8::Value> frame;
         if (!frames->Get(sc, i).ToLocal(&frame)) break;
         auto location = get_field(sc, frame, "location");
@@ -1574,7 +1643,8 @@ void capture_record(Capture& cap, const std::string& message)
         uint32_t k = 0;
         if (scopes_v->IsArray()) {
             auto scopes = scopes_v.As<v8::Array>();
-            for (uint32_t j = 0; j < scopes->Length(); j++) {
+            for (uint32_t j = 0, m = scopes->Length(); j < m && k < kCaptureScopes; j++) {
+                if (walk.out_of_time()) break;
                 v8::Local<v8::Value> scope, object;
                 if (!scopes->Get(sc, j).ToLocal(&scope)) break;
                 std::string type = walk.utf8(get_field(sc, scope, "type"));
