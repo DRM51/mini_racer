@@ -1,3 +1,11 @@
+- 0.22.2.14 - 26-10-2026
+  - DRM51 build: 0.22.2.13 plus the changes below
+  - Add `Context.new(decimal: :string)`, which passes a `BigDecimal` as its exact digits (`"12345678901234567890.5"`) where `:float` keeps about 15 significant digits
+  - `date: :iso` writes a year before 0 or after 9999 in ECMAScript's expanded form (`"+012345-06-07"`), which `new Date()` can parse
+  - Add `MiniRacer::CONVERSIONS`, the `date:` and `decimal:` values this build accepts, so callers can check for an option instead of the version
+  - Inspector: malformed or ambiguous HTTP requests and WebSocket frames close the connection; outgoing messages are queued, so a slow debugger can't block the script; a detach discards the console messages kept for the next debugger
+  - A very small `max_value_size` ends in an error, not an abort or endless retries; `capture_on_throw` expressions stop at the recording deadline and fall back to an outer frame only on a real `ReferenceError`
+
 - 0.22.2.13 - 26-10-2026
   - DRM51 build: 0.22.2.12 plus the change below
   - `capture_on_throw: {expressions: [...]}`, from drm51_mini_racer 14.6.202.34.2: up to 20 JavaScript expressions evaluated in the failing frame (or the next one out where their names are defined), in V8's side-effect-free mode with a 50 ms limit each; results in `capture["expressions"]`
