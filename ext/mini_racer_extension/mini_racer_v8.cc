@@ -770,6 +770,9 @@ struct Inspector
     // dispatch; a disconnect then only resumes and the session goes later
     bool disconnect_pending = false;
     int dispatch_depth = 0;
+    // the frontend asked to pause on exceptions (Debugger.setPauseOnExceptions
+    // with a state other than "none"); see verbose_try_catch
+    bool pause_on_exceptions = false;
     // read by ruby threads
     std::atomic<bool> attached{false};
     std::atomic<bool> ready{false};
@@ -808,6 +811,22 @@ void InspectorClient::runIfWaitingForDebugger(int)
 void InspectorClient::quitMessageLoopOnPause()
 {
     in.quit_pause = true;
+}
+
+// The "state" of a Debugger.setPauseOnExceptions message, or "" for any
+// other message. Frontends send compact JSON; this only needs to find the
+// one field, not validate the message (V8 does that).
+std::string pause_on_exceptions_state(const std::string& msg)
+{
+    if (msg.find("\"Debugger.setPauseOnExceptions\"") == std::string::npos)
+        return std::string();
+    size_t i = msg.find("\"state\"");
+    if (i == std::string::npos) return std::string();
+    i = msg.find('"', msg.find(':', i + 7));
+    if (i == std::string::npos) return std::string();
+    size_t j = msg.find('"', i + 1);
+    if (j == std::string::npos) return std::string();
+    return msg.substr(i + 1, j - i - 1);
 }
 
 void inspector_drop_session_if_safe(Inspector& in)
@@ -857,6 +876,7 @@ bool inspector_drain(Inspector& in)
             in.attached = false;
             in.ready = false;
             in.break_next = false;
+            in.pause_on_exceptions = false;
             if (!in.session)
                 break;
             in.disconnect_pending = true;
@@ -870,6 +890,9 @@ bool inspector_drain(Inspector& in)
             if (!in.session || in.disconnect_pending)
                 break;
             {
+                std::string state = pause_on_exceptions_state(msg);
+                if (!state.empty())
+                    in.pause_on_exceptions = (state != "none");
                 std::vector<uint16_t> u16 = utf8_to_utf16(msg);
                 in.dispatch_depth++;
                 in.session->dispatchProtocolMessage(
@@ -1185,16 +1208,18 @@ void capture_teardown(State& st)
 }
 
 // V8 reports a verbose TryCatch's exception to message listeners, and
-// prints it when there are none. Capture mode needs verbose TryCatches (see
-// verbose_try_catch) but should stay as quiet as before.
-void capture_message_listener(v8::Local<v8::Message>, v8::Local<v8::Value>) {}
+// prints it when there are none. Capture mode and a debugger pausing on
+// exceptions need verbose TryCatches (see verbose_try_catch) but should
+// stay as quiet as before.
+void quiet_message_listener(v8::Local<v8::Message>, v8::Local<v8::Value>) {}
 
 // The debugger counts an exception as caught when a non-verbose TryCatch,
 // mini_racer's default, would catch it, so it would never pause on one
 // that escapes to Ruby. A verbose TryCatch doesn't count.
 bool verbose_try_catch(const State& st)
 {
-    return st.verbose_exceptions || st.capture;
+    return st.verbose_exceptions || st.capture ||
+           (st.inspector && st.inspector->pause_on_exceptions);
 }
 
 struct CaptureWalk
@@ -1976,11 +2001,10 @@ extern "C" State *v8_thread_init(Context *c, const uint8_t *snapshot_buf,
         }
         if (inspector_title)
             inspector_init(st, inspector_title);
-        if (capture_on_throw) {
+        if (capture_on_throw)
             capture_init(st, capture_expressions_buf, capture_expressions_len);
-            if (!st.verbose_exceptions)
-                st.isolate->AddMessageListener(capture_message_listener);
-        }
+        if ((inspector_title || capture_on_throw) && !st.verbose_exceptions)
+            st.isolate->AddMessageListener(quiet_message_listener);
         v8_thread_main(c, pst); // shuts the inspector down on its way out
     }
     delete pst;
