@@ -814,6 +814,15 @@ static int serialize1(Ser *s, VALUE refs, VALUE v, int depth, int opts)
 
 // don't mix with ser_array_begin/ser_object_begin because
 // that will throw off the object reference count
+// Raises if writing a request failed (too large or out of memory).
+static void ser_check(Ser *s, const char *what)
+{
+    if (!*s->err)
+        return;
+    ser_reset(s);
+    rb_raise(runtime_error, "%s: %s", what, s->err);
+}
+
 static int serialize(Ser *s, VALUE v, int opts)
 {
     VALUE refs = rb_hash_new();
@@ -1131,11 +1140,18 @@ int v8_context_quitting(Context *c)
     return atomic_load(&c->quit) != 0;
 }
 
-void v8_reply(Context *c, const uint8_t *p, size_t n)
+// Returns 0, or BUF_TOO_LARGE or BUF_NO_MEMORY with the reply discarded, so
+// Ruby never reads part of one.
+int v8_reply(Context *c, const uint8_t *p, size_t n)
 {
+    int r;
+
     pthread_mutex_lock(&c->mtx);
-    buf_put(&c->res, p, n);
+    r = buf_put(&c->res, p, n);
+    if (r)
+        buf_reset(&c->res);
     pthread_mutex_unlock(&c->mtx);
+    return r;
 }
 
 static void v8_once_init(void)
@@ -1464,7 +1480,7 @@ next:
     pthread_cond_broadcast(&c->cv);
     pthread_mutex_unlock(&c->mtx);
     atomic_store(&a->active, 0);
-    if (*a->res->buf == 'c') { // js -> ruby callback?
+    if (a->res->len && *a->res->buf == 'c') { // js -> ruby callback?
         rb_thread_call_with_gvl(rendezvous_callback, a);
         buf_reset(a->res);
         if (atomic_load(&c->quit)) {
@@ -1910,6 +1926,7 @@ static VALUE context_attach(VALUE self, VALUE name, VALUE proc)
     add_string(&s, name);
     ser_int(&s, id);
     ser_array_end(&s, 2);
+    ser_check(&s, "Context.attach");
     rb_ary_push(c->procs, proc);
     // response is an exception or undefined
     e = rendezvous(c, &s.b);
@@ -2092,6 +2109,7 @@ static VALUE context_eval_common(int argc, VALUE *argv, VALUE self, char op)
     add_string(&s, filename);
     add_string(&s, source);
     ser_array_end(&s, 2);
+    ser_check(&s, "Context.eval");
     // response is [result, errname] array
     a = rendezvous(c, &s.b); // takes ownership of |s.b|
     e = rb_ary_pop(a);
@@ -2142,6 +2160,8 @@ static VALUE heap_snapshot_to_str(VALUE arg)
     Buf *res;
 
     res = (Buf *)arg;
+    if (!res->len) // v8_reply refused it
+        rb_raise(runtime_error, "heap snapshot too large (over 1 GiB) or out of memory");
     return rb_utf8_str_new((char *)res->buf, res->len);
 }
 
@@ -2542,6 +2562,7 @@ static VALUE snapshot_initialize(int argc, VALUE *argv, VALUE self)
     // request is snapsho(T), "code"
     ser_init1(&s, 'T');
     add_string(&s, code);
+    ser_check(&s, "Snapshot.new");
     // response is [arraybuffer, error]
     DesCtx_init(&d);
     d.transcode_latin1 = 0; // don't mangle snapshot binary data
@@ -2572,6 +2593,7 @@ static VALUE snapshot_warmup(VALUE self, VALUE arg)
     ser_string8(&s, (const uint8_t *)RSTRING_PTR(ss->blob), RSTRING_LENINT(ss->blob));
     add_string(&s, arg);
     ser_array_end(&s, 2);
+    ser_check(&s, "Snapshot.warmup!");
     // response is [arraybuffer, error]
     DesCtx_init(&d);
     d.transcode_latin1 = 0; // don't mangle snapshot binary data
