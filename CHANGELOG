@@ -1,4 +1,4 @@
-- DRM51 builds of 0.22.2 on V8 13.6, 0.22.2.1 to 0.22.2.15 - 25-10-2026 to 26-10-2026
+- DRM51 builds of 0.22.2 on V8 13.6, 0.22.2.1 to 0.22.2.16 - 25-10-2026 to 26-10-2026
   The fourth version segment numbers our builds; upstream doesn't use it. Builds are published at https://drm51.github.io/gems, which lists only the ones in use; every build stays on GitHub as a signed tag and release.
 
   What the DRM51 build adds to upstream 0.22.2 and its unreleased fixes:
@@ -20,9 +20,10 @@
   - From upstream issues: multiline error messages kept apart from backtraces (#262), Ruby `Date` values converted to JavaScript `Date` (#136), `Context#load` returns nil without invoking getters (#197)
 
   Builds:
+  - 0.22.2.16: Codex's review of 0.22.2.15 (debugger handover during a pause, closed connections no longer kept in memory, plain-identifier probes, close codes 1012-1014, the decimal exponent bound); tested on Debian trixie, as integration_tool deploys. The version integration_tool pins
   - 0.22.2.15: Codex's review of 0.22.2.14 (debugger session isolation, attach errors held to the value limit, stricter parsing)
   - 0.22.2.14: `decimal: :string`, far years, `MiniRacer::CONVERSIONS`; inspector transport hardening
-  - 0.22.2.13: capture expressions. The version integration_tool pins
+  - 0.22.2.13: capture expressions
   - 0.22.2.1 to 0.22.2.12 (odd numbers): earlier steps toward the above; 0.22.2.2 to 0.22.2.8 (even numbers) were the same code on V8 14.6, now drm51_mini_racer
 
 - 0.22.2 - 23-10-2026
