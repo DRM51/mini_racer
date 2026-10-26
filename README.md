@@ -177,7 +177,9 @@ buffers can briefly exceed the limit.
 Resizable ArrayBuffers and growable SharedArrayBuffers (`new ArrayBuffer(n,
 {maxByteLength})`) take memory V8 doesn't let mini_racer count, so with
 `max_memory:` constructing one throws a `RangeError`. Without `max_memory:`
-they work as usual.
+they work as usual. The constructors are guarded when the context starts,
+so code in a custom `MiniRacer::Snapshot` (which runs earlier) could keep
+the originals; snapshots are trusted code.
 
 It doesn't cover:
 
