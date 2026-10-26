@@ -487,7 +487,7 @@ class MiniRacerCaptureTest < Minitest::Test
     assert_equal ["out of memory", "2"], out.lines.map(&:chomp)
   end
 
-  def test_large_array_like_objects_are_probed_not_listed
+  def test_large_sparse_and_hidden_keys
     ctx = new_context
     capture =
       capture_of do
@@ -499,11 +499,18 @@ class MiniRacerCaptureTest < Minitest::Test
       end
     big = variables(capture["frames"][0], "script")["big"]
     assert_equal (0...50).map(&:to_s) + ["\u2026"], big.keys
-    assert_equal "more", big["\u2026"]
-    # integer keys stop at 50 without crowding out the named ones
-    small = capture_of { ctx.eval("const o = { 0: 'a', 1: 'b', name: 'c' }; throw o") }
-    assert_equal({ "0" => "a", "1" => "b", "name" => "c" },
-                 variables(small["frames"][0], "script")["o"])
+    assert_equal "999951 more", big["\u2026"]
+    # integer keys anywhere, in order and before names; non-enumerable ones stay hidden
+    sparse =
+      capture_of do
+        ctx.eval(<<~JS)
+          const o = { name: "c", 1000: "far", 0: "a" }
+          Object.defineProperty(o, 5, { value: "hidden", enumerable: false })
+          throw o
+        JS
+      end
+    assert_equal({ "0" => "a", "1000" => "far", "name" => "c" },
+                 variables(sparse["frames"][0], "script")["o"])
   end
 
   def test_scopes_per_frame_are_bounded

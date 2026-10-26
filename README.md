@@ -152,7 +152,15 @@ context.eval("var a = new Array(10000); while(true) {a = a.concat(new Array(1000
 (V8 keeps it outside its heap): an allocation that would take the heap size
 at the last garbage collection plus all live buffers past the limit fails
 with a `RangeError` ("Array buffer allocation failed") that the script can
-catch, after V8 has collected garbage and retried.
+catch, after V8 has collected garbage and retried. A heap that grows past
+the limit together with the buffers already held ends the script with
+`V8OutOfMemoryError` (after two full garbage collections in a row find it
+over, since dead buffers are freed just after one).
+
+Resizable ArrayBuffers and growable SharedArrayBuffers (`new ArrayBuffer(n,
+{maxByteLength})`) take memory V8 doesn't let mini_racer count, so with
+`max_memory:` constructing one throws a `RangeError`. Without `max_memory:`
+they work as usual.
 
 It doesn't cover:
 
