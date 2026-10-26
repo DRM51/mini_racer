@@ -149,6 +149,47 @@ namespace {
 // not safe to destroy after main() returns
 v8::Platform *platform;
 
+// v8_reply takes at most 1 GiB. V8 asks for about twice what it needs when
+// its buffer grows, so stopping it at 2 GiB bounds the memory a value like
+// Array(1e6).fill(bigString) can take without refusing anything v8_reply
+// would accept.
+constexpr size_t kMaxSerializerBuffer = (size_t{2} << 30) + 64;
+
+struct SerializerDelegate : v8::ValueSerializer::Delegate
+{
+    v8::Isolate *isolate;
+    bool refused = false;
+
+    explicit SerializerDelegate(v8::Isolate *isolate) : isolate(isolate) {}
+
+    void ThrowDataCloneError(v8::Local<v8::String> message) final
+    {
+        if (refused) {
+            message = v8::String::NewFromUtf8Literal(
+                isolate, "value too large to return to Ruby (over 1 GiB)");
+            isolate->ThrowException(v8::Exception::RangeError(message));
+            return;
+        }
+        isolate->ThrowException(v8::Exception::Error(message)); // as V8 does without a delegate
+    }
+
+    void *ReallocateBufferMemory(void *old_buffer, size_t size, size_t *actual_size) final
+    {
+        if (size > kMaxSerializerBuffer) {
+            refused = true;
+            return nullptr; // V8 keeps |old_buffer| and throws a DataCloneError
+        }
+        void *p = realloc(old_buffer, size);
+        if (p) *actual_size = size;
+        return p;
+    }
+
+    void FreeBufferMemory(void *buffer) final
+    {
+        free(buffer);
+    }
+};
+
 struct Serialized
 {
     uint8_t *data = nullptr;
@@ -156,7 +197,8 @@ struct Serialized
 
     Serialized(State& st, v8::Local<v8::Value> v)
     {
-        v8::ValueSerializer ser(st.isolate);
+        SerializerDelegate delegate(st.isolate);
+        v8::ValueSerializer ser(st.isolate, &delegate);
         ser.WriteHeader();
         if (!ser.WriteValue(st.context, v).FromMaybe(false)) return; // exception pending
         auto pair = ser.Release();
@@ -169,6 +211,19 @@ struct Serialized
         free(data);
     }
 };
+
+// Hands |n| bytes to the Ruby thread. When v8_reply refuses them (over its
+// 1 GiB limit, or out of memory), throws a RangeError and returns false.
+bool send_reply(State& st, const uint8_t *p, size_t n)
+{
+    int r = v8_reply(st.ruby_context, p, n);
+    if (!r) return true;
+    auto message = r == -1
+        ? v8::String::NewFromUtf8Literal(st.isolate, "value too large to return to Ruby (over 1 GiB)")
+        : v8::String::NewFromUtf8Literal(st.isolate, "out of memory returning a value to Ruby");
+    st.isolate->ThrowException(v8::Exception::RangeError(message));
+    return false;
+}
 
 void append_bytes(std::vector<char>& out, const char *p, size_t n)
 {
@@ -299,8 +354,9 @@ bool reply(State& st, v8::Local<v8::Value> v)
     {
         Serialized serialized(st, v);
         if (serialized.data) {
-            v8_reply(st.ruby_context, serialized.data, serialized.size);
-            return true;
+            if (send_reply(st, serialized.data, serialized.size)) return true;
+            try_catch.ReThrow();
+            return false;
         }
     }
     if (!try_catch.CanContinue()) {
@@ -313,11 +369,10 @@ bool reply(State& st, v8::Local<v8::Value> v)
         return false;
     }
     Serialized serialized(st, v);
-    if (serialized.data)
-        v8_reply(st.ruby_context, serialized.data, serialized.size);
-    else
-        try_catch.ReThrow();
-    return serialized.data != nullptr; // exception pending if false
+    if (serialized.data && send_reply(st, serialized.data, serialized.size))
+        return true;
+    try_catch.ReThrow();
+    return false; // exception pending
 }
 
 bool reply(State& st, v8::Local<v8::Value> result, v8::Local<v8::Value> err)
@@ -1667,8 +1722,9 @@ void v8_api_callback(const v8::FunctionCallbackInfo<v8::Value>& info)
         Serialized serialized(st, request);
         if (!serialized.data) return; // exception pending
         uint8_t marker = 'c'; // callback marker
-        v8_reply(st.ruby_context, &marker, 1);
-        v8_reply(st.ruby_context, serialized.data, serialized.size);
+        if (!send_reply(st, &marker, 1)) return;
+        // on failure the marker is discarded with it
+        if (!send_reply(st, serialized.data, serialized.size)) return;
     }
     const uint8_t *p;
     size_t n;
@@ -2111,7 +2167,8 @@ extern "C" void v8_heap_snapshot(State *pst)
     OutputStream os;
     snapshot->Serialize(&os, v8::HeapSnapshot::kJSON);
     const_cast<v8::HeapSnapshot*>(snapshot)->Delete();
-    v8_reply(st.ruby_context, os.buf.data(), os.buf.size()); // not serialized because big
+    // not serialized because big; Ruby raises if v8_reply refuses it
+    v8_reply(st.ruby_context, os.buf.data(), os.buf.size());
 }
 
 extern "C" void v8_perform_microtask_checkpoint(State *pst)

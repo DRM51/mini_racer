@@ -29,7 +29,7 @@ extern int single_threaded;
 void v8_get_flags(char **p, size_t *n);
 void v8_thread_main(struct Context *c, struct State *pst);
 void v8_dispatch(struct Context *c);
-void v8_reply(struct Context *c, const uint8_t *p, size_t n);
+int v8_reply(struct Context *c, const uint8_t *p, size_t n); // 0 or < 0, see serde.c
 void v8_roundtrip(struct Context *c, const uint8_t **p, size_t *n);
 void v8_inspector_wake(struct Context *c); // any thread; wakes an idle v8 thread
 void v8_inspector_paused(struct Context *c, int paused); // v8 thread

@@ -2711,4 +2711,55 @@ class MiniRacerTest < Minitest::Test
     assert e
     assert_equal(e.message.encoding.to_s, "UTF-8")
   end
+
+  # Each case is refused at 1 GiB. A child process, since each one takes
+  # over a gigabyte of memory.
+  def test_values_over_the_size_limit_are_refused
+    skip "TruffleRuby doesn't use the C serializer" if RUBY_ENGINE == "truffleruby"
+    require "open3"
+    require "rbconfig"
+
+    script = <<~RUBY
+      require "mini_racer"
+      mib = "x" * (1 << 20)
+      ctx = MiniRacer::Context.new
+      ctx.eval("function count(a) { return a.length }")
+      # Ruby to JS: 1100 references to one 1 MiB string serialize to 1.1 GiB
+      begin
+        ctx.call("count", [mib] * 1100)
+        puts "call: accepted"
+      rescue MiniRacer::RuntimeError => e
+        puts "call: \#{e.message}"
+      end
+      # JS to Ruby: the same, built by V8
+      begin
+        ctx.eval("const mib = 'x'.repeat(1 << 20); Array(1100).fill(mib)")
+        puts "eval: accepted"
+      rescue MiniRacer::RuntimeError => e
+        puts "eval: \#{e.message}"
+      end
+      # a Ruby callback's result, and a JS callback's arguments
+      ctx.attach("big", -> { [mib] * 1100 })
+      ctx.attach("take", ->(*a) { a.size })
+      puts "callback result: \#{ctx.eval("try { big(); 'accepted' } catch (e) { String(e) }")}"
+      puts "callback args: \#{ctx.eval("try { take(...Array(1100).fill(mib)); 'accepted' } catch (e) { String(e) }")}"
+      puts "after: \#{ctx.eval("1 + 1")}"
+    RUBY
+    stdout, stderr, status =
+      Open3.capture3(
+        RbConfig.ruby,
+        "-I#{File.expand_path("../lib", __dir__)}",
+        "-e",
+        script
+      )
+    assert status.success?, "child failed (#{status}): #{stderr}"
+    lines = stdout.lines.map(&:chomp)
+    assert_equal 5, lines.size, stdout
+    assert_match(/\Acall: Context.call: serialized value too large/, lines[0])
+    assert_match(/\Aeval: RangeError: value too large to return to Ruby/, lines[1])
+    assert_match(/\Acallback result: .*serialized value too large/, lines[2])
+    assert_match(/\Acallback args: RangeError: value too large to return to Ruby/, lines[3])
+    assert_equal "after: 2", lines[4]
+  end
+
 end

@@ -53,14 +53,24 @@ typedef struct Ser {
 
 static const uint8_t the_nan[8] = {0,0,0,0,0,0,0xF8,0x7F}; // canonical nan
 
-// note: returns |v| if v in [0,1,2]
-static inline uint32_t next_power_of_two(uint32_t v) {
+// The largest buffer: a serialized value, a reply, or a heap snapshot.
+// Anything bigger is refused with BUF_TOO_LARGE instead of being copied.
+#define BUF_MAX ((size_t)1 << 30) // 1 GiB
+
+enum {
+    BUF_TOO_LARGE = -1,
+    BUF_NO_MEMORY = -2,
+};
+
+// note: returns |v| if v in [0,1,2]; |v| must be at most 2^63
+static inline uint64_t next_power_of_two(uint64_t v) {
   v -= 1;
   v |= v >> 1;
   v |= v >> 2;
   v |= v >> 4;
   v |= v >> 8;
   v |= v >> 16;
+  v |= v >> 32;
   v += 1;
   return v;
 }
@@ -89,35 +99,39 @@ static inline void buf_move(Buf *s, Buf *d)
     buf_init(s);
 }
 
+// Makes room for |n| more bytes. Returns BUF_TOO_LARGE or BUF_NO_MEMORY,
+// leaving |b| as it was, when it can't.
 static inline int buf_grow(Buf *b, size_t n)
 {
     void *p;
 
-    if ((uint64_t)n + b->len > UINT32_MAX)
-        return -1;
+    if (n > BUF_MAX || b->len > BUF_MAX - n)
+        return BUF_TOO_LARGE;
     n += b->len;
     if (n < b->cap)
         return 0;
-    n = next_power_of_two(n);
+    n = next_power_of_two(n); // BUF_MAX is a power of two, so n <= BUF_MAX
     p = NULL;
     if (b->buf != b->buf_s)
         p = b->buf;
     p = realloc(p, n);
     if (!p)
-        return -1;
+        return BUF_NO_MEMORY;
     if (b->buf == b->buf_s)
         memcpy(p, b->buf_s, b->len);
     b->buf = p;
-    b->cap = n;
+    b->cap = (uint32_t)n;
     return 0;
 }
 
 static inline int buf_put(Buf *b, const void *p, size_t n)
 {
+    int r;
+
     if (n == 0)
         return 0;
-    if (buf_grow(b, n))
-        return -1;
+    if ((r = buf_grow(b, n)))
+        return r;
     memcpy(&b->buf[b->len], p, n);
     b->len += n;
     return 0;
@@ -130,9 +144,14 @@ static inline int buf_putc(Buf *b, uint8_t c)
 
 static inline void w(Ser *s, const void *p, size_t n)
 {
+    int r;
+
     if (*s->err)
         return;
-    if (buf_put(&s->b, p, n))
+    r = buf_put(&s->b, p, n);
+    if (r == BUF_TOO_LARGE)
+        snprintf(s->err, sizeof(s->err), "serialized value too large (over 1 GiB)");
+    else if (r)
         snprintf(s->err, sizeof(s->err), "out of memory");
 }
 
