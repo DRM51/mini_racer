@@ -956,13 +956,12 @@ void inspector_create(Inspector& in)
     in.inspector->contextCreated(info);
 }
 
-// Runs every queued frontend event, or with |one| only the next. Returns
-// whether there were any.
-bool inspector_drain(Inspector& in, bool one = false)
+// Runs queued frontend events, at most |max| of them. Returns how many.
+size_t inspector_drain(Inspector& in, size_t max = SIZE_MAX)
 {
-    bool any = false;
+    size_t any = 0;
     std::string msg;
-    for (;;) {
+    while (any < max) {
         // A frontend that attaches while the last one's command is still
         // being dispatched (it paused, and this is the pause loop) waits
         // until that unwinds: the command's reply then goes to no one, and
@@ -972,7 +971,7 @@ bool inspector_drain(Inspector& in, bool one = false)
         mri::Event ev = mri::poll(*in.target, &msg, in.disconnect_pending && in.dispatch_depth > 0);
         if (ev == mri::Event::None)
             break;
-        any = true;
+        any++;
         switch (ev) {
         case mri::Event::Connect:
             if (in.session && in.disconnect_pending) {
@@ -1037,8 +1036,6 @@ bool inspector_drain(Inspector& in, bool one = false)
         case mri::Event::None:
             break;
         }
-        if (one)
-            break;
     }
     return any;
 }
@@ -1082,9 +1079,16 @@ void inspector_interrupt(v8::Isolate *, void *arg)
 {
     State& st = *static_cast<State*>(arg);
     Inspector *in = st.inspector.get();
-    // a pause loop or a dispatch further up the stack drains instead
-    if (in && !in->paused && in->dispatch_depth == 0)
-        inspector_drain(*in);
+    // a pause loop or a dispatch further up the stack drains instead.
+    // Inside an eval, a batch at a time: the eval's own JavaScript runs
+    // between batches, so a frontend's backlog can't hold it up for as long
+    // as the backlog takes, and the interrupt is asked for again for the rest.
+    // (What the batch runs counts against the eval's timeout: the frontend
+    // is debugging that eval.)
+    constexpr size_t kInterruptBatch = 8;
+    if (in && !in->paused && in->dispatch_depth == 0 &&
+        inspector_drain(*in, kInterruptBatch) == kInterruptBatch)
+        st.isolate->RequestInterrupt(inspector_interrupt, &st);
 }
 
 // Runs on the v8 thread when it's blocked in await_promise(), where an
@@ -3253,7 +3257,7 @@ extern "C" int v8_inspector_dispatch(State *pst)
     v8::HandleScope handle_scope(st.isolate);
     st.inspector_idle = true;
     inspector_drop_session_if_safe(*in);
-    bool any = inspector_drain(*in, true); // one, under its own watchdog
+    bool any = inspector_drain(*in, 1) > 0; // one, under its own watchdog
     st.inspector_idle = false;
     return any;
 }

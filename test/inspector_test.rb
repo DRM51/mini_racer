@@ -867,7 +867,7 @@ class MiniRacerInspectorTest < Minitest::Test
       JSON.generate(id: 100 + i, method: "Runtime.evaluate",
                     params: { expression: "for (const t = Date.now(); Date.now() - t < 30;); #{i}" })
     })
-    sleep 0.2 # the V8 thread is working through them
+    client.wait_response(100) # the V8 thread has started on them
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     assert_equal 2, ctx.eval("1 + 1")
     assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 1.5,
@@ -888,7 +888,10 @@ class MiniRacerInspectorTest < Minitest::Test
     endless = { callFrameId: frame, expression: "for (;;) {}" }
     client.send_texts(JSON.generate(id: 20, method: "Debugger.evaluateOnCallFrame", params: endless),
                       JSON.generate(id: 21, method: "Debugger.evaluateOnCallFrame", params: endless))
-    # max_pause ends the pause and what runs in it, the second command too
+    # max_pause ends the pause and what runs in it, the second command too:
+    # both answer, and the eval returns
+    replies = [20, 21].map { |id| client.wait_message(id, timeout: 8) }
+    assert_equal [20, 21], replies.map { _1["id"] }
     assert th.join(8), "the eval never returned: a nested command ran unwatched"
     assert_equal 2, ctx.eval("1 + 1")
   end
@@ -1105,13 +1108,16 @@ class MiniRacerInspectorTest < Minitest::Test
     ctx = new_context(inspector: "idle-timeout", timeout: 300)
     client = connect("idle-timeout")
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    # queued together: the endless one is stopped at its 300 ms, and the next
-    # still runs, under its own watchdog, rather than not at all
-    client.send_texts(JSON.generate(id: 9, method: "Runtime.evaluate", params: { expression: "for (;;) {}" }),
-                      JSON.generate(id: 10, method: "Runtime.evaluate", params: { expression: "6 * 7" }))
+    # queued together, both endless: each is stopped at its own 300 ms, so
+    # the second can't have run unwatched (it would never answer), and the
+    # pair takes at least two timeouts
+    endless = JSON.generate(method: "Runtime.evaluate", params: { expression: "for (;;) {}" })
+    client.send_texts(endless.sub("{", '{"id":9,'), endless.sub("{", '{"id":10,'))
     assert_equal "Execution was terminated", client.wait_message(9)["error"]["message"]
-    assert_equal 42, client.wait_response(10, timeout: 5)["result"]["value"]
-    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 4
+    assert_equal "Execution was terminated", client.wait_message(10)["error"]["message"]
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+    assert_operator elapsed, :>=, 0.55
+    assert_operator elapsed, :<, 4
     assert_equal 2, ctx.eval("1 + 1") # and the termination doesn't leak into the next eval
   end
 
