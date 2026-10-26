@@ -901,6 +901,26 @@ class MiniRacerInspectorTest < Minitest::Test
     assert_equal 2, ctx.eval("1 + 1")
   end
 
+  def test_commands_left_queued_when_a_pause_ends_are_answered_while_the_script_runs
+    ctx = new_context(inspector: "resume-backlog", timeout: 10_000)
+    client = attach_like_devtools("resume-backlog")
+    th = Thread.new { ctx.eval("debugger; for (const t = Date.now(); Date.now() - t < 2000;); 'done'") }
+    frame = client.wait_event("Debugger.paused")["callFrames"][0]["callFrameId"]
+    # A nested evaluation runs JavaScript in the pause, which spends the
+    # interrupt the frontend's wake asked for (it does nothing while
+    # paused). Then the resume, and more than a pause batch (64) behind it:
+    # the rest are still queued when the pause ends, with no interrupt left.
+    nested = JSON.generate(id: 998, method: "Debugger.evaluateOnCallFrame",
+                           params: { callFrameId: frame, expression: "for (let i = 0; i < 1e6; i++); 1" })
+    commands = Array.new(100) { |i| JSON.generate(id: 1000 + i, method: "Runtime.evaluate", params: { expression: i.to_s }) }
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    client.send_texts(nested, JSON.generate(id: 999, method: "Debugger.resume", params: {}), *commands)
+    assert_equal 99, client.wait_response(1099, timeout: 5)["result"]["value"]
+    # answered while the resumed script runs, not after its 2 s
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 1.5
+    assert_equal "done", th.value
+  end
+
   def test_reconnecting_while_the_context_is_busy_is_refused_at_the_queue_cap
     script = <<~'RUBY'
       require "mini_racer"
