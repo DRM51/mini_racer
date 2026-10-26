@@ -9,7 +9,6 @@
 #include <chrono>
 #include <cmath>
 #include <iterator>
-#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -1841,178 +1840,6 @@ bool names_undefined_identifier(const std::string& error, const std::string& exp
     return false;
 }
 
-
-// let, const and class bindings are in their temporal dead zone until
-// their declaration completes, but where V8 can prove a binding is never
-// read early it drops the check, and a block entered again (a loop's next
-// iteration) then still holds the last iteration's value: the debugger
-// reports it as current, and DevTools shows the same. So a scope's binding
-// is shown as not yet declared when its let/const/class declaration in the
-// scope comes after the paused position and none before it, or when the
-// paused position is inside that declaration's own statement (its
-// initializer threw). Read from the source text: a declaration in a comment
-// or a string can hide one (the value then shows as V8 gives it), and a
-// statement left to automatic semicolons ends at a line that doesn't
-// continue the expression.
-const char kNotYetDeclared[] = "[Not yet declared]";
-
-bool ident16(char16_t c)
-{
-    return (c >= u'a' && c <= u'z') || (c >= u'A' && c <= u'Z') || (c >= u'0' && c <= u'9') ||
-           c == u'_' || c == u'$' || c >= 0x80;
-}
-
-bool space16(char16_t c) { return c == u' ' || c == u'\t' || c == u'\n' || c == u'\r'; }
-
-// CDP's line and column (UTF-16 units, from 0) as an offset into |src|
-size_t source_offset(const std::u16string& src, int line, int column)
-{
-    size_t at = 0;
-    for (int l = 0; l < line; l++) {
-        size_t nl = src.find(u'\n', at);
-        if (nl == std::u16string::npos) return src.size();
-        at = nl + 1;
-    }
-    return std::min(src.size(), at + static_cast<size_t>(std::max(column, 0)));
-}
-
-bool word_at(const std::u16string& src, size_t at, const std::u16string& word)
-{
-    return src.compare(at, word.size(), word) == 0 && (at == 0 || !ident16(src[at - 1])) &&
-           (at + word.size() >= src.size() || !ident16(src[at + word.size()]));
-}
-
-// Where the last let/const/class declaring |name| in src[from, to) starts,
-// or npos. A destructuring pattern declares the names in it that aren't
-// property keys ({ key: name }).
-size_t declaration_of(const std::u16string& src, size_t from, size_t to, const std::u16string& name)
-{
-    static const std::u16string keywords[] = { u"let", u"const", u"class" };
-    size_t found = std::u16string::npos;
-    to = std::min(to, src.size());
-    for (size_t p = from; p < to; p++) {
-        for (auto& kw : keywords) {
-            if (!word_at(src, p, kw)) continue;
-            size_t q = p + kw.size();
-            while (q < to && space16(src[q])) q++;
-            if (q < to && (src[q] == u'[' || src[q] == u'{')) {
-                int depth = 0;
-                for (size_t r = q; r < to; r++) {
-                    char16_t c = src[r];
-                    if (c == u'[' || c == u'{') {
-                        depth++;
-                    } else if (c == u']' || c == u'}') {
-                        if (--depth == 0) break;
-                    } else if (word_at(src, r, name)) {
-                        size_t after = r + name.size();
-                        while (after < to && space16(src[after])) after++;
-                        if (after >= to || src[after] != u':') { found = p; break; }
-                    }
-                }
-            } else if (q < to && word_at(src, q, name)) {
-                found = p;
-            }
-        }
-    }
-    return found;
-}
-
-// Where the statement starting at |at| ends: a ';' or a closing bracket
-// outside its own brackets, or a line break the next line doesn't continue
-bool statement_continues(const std::u16string& src, size_t nl)
-{
-    static const std::u16string ends = u"=+-*/%&|^!~?:,.([{<>";
-    static const std::u16string starts = u".?:+-*/%&|^,)]}=<>";
-    size_t before = nl;
-    while (before > 0 && space16(src[before - 1])) before--;
-    if (before > 0 && ends.find(src[before - 1]) != std::u16string::npos) return true;
-    size_t after = nl;
-    while (after < src.size() && space16(src[after])) after++;
-    return after < src.size() && starts.find(src[after]) != std::u16string::npos;
-}
-
-size_t statement_end(const std::u16string& src, size_t at)
-{
-    int depth = 0;
-    for (size_t p = at; p < src.size(); p++) {
-        char16_t c = src[p];
-        if (c == u'(' || c == u'[' || c == u'{') depth++;
-        else if (c == u')' || c == u']' || c == u'}') { if (--depth < 0) return p; }
-        else if (depth == 0 && c == u';') return p;
-        else if (depth == 0 && c == u'\n' && !statement_continues(src, p)) return p;
-    }
-    return src.size();
-}
-
-// Debugger.getScriptSource as UTF-16, the unit CDP's columns count in
-bool capture_script_source(Capture& cap, CaptureWalk& walk, const std::string& script_id, std::u16string *out)
-{
-    State& st = cap.st;
-    auto sc = st.safe_context;
-    for (char c : script_id) if (c < '0' || c > '9') return false; // V8's ids are digits
-    std::string request = "{\"id\":" + std::to_string(++cap.pending_id) +
-        ",\"method\":\"Debugger.getScriptSource\",\"params\":{\"scriptId\":\"" + script_id + "\"}}";
-    cap.response.clear();
-    capture_dispatch(cap, request.c_str());
-    v8::Local<v8::Value> parsed;
-    if (cap.response.empty() || !v8::JSON::Parse(sc, walk.str(cap.response)).ToLocal(&parsed)) return false;
-    auto text = get_field(sc, get_field(sc, parsed, "result"), "scriptSource");
-    if (!text->IsString()) return false;
-    auto source = text.As<v8::String>();
-    out->resize(source->Length());
-    source->WriteV2(st.isolate, 0, source->Length(), reinterpret_cast<uint16_t *>(out->data()));
-    return true;
-}
-
-// Replaces, in a scope's copied variables, the let/const/class bindings not
-// yet declared at the frame's position with kNotYetDeclared (see above).
-void mark_not_yet_declared(Capture& cap, CaptureWalk& walk, v8::Local<v8::Value> scope, const std::string& type,
-                           v8::Local<v8::Value> location, std::map<std::string, std::u16string>& sources,
-                           v8::Local<v8::Value> variables)
-{
-    if (!variables->IsObject() || (type != "block" && type != "local" && type != "script" && type != "module"))
-        return;
-    auto sc = cap.st.safe_context;
-    std::string id = walk.utf8(get_field(sc, location, "scriptId"));
-    auto it = sources.find(id);
-    if (it == sources.end()) {
-        std::u16string text;
-        if (!capture_script_source(cap, walk, id, &text)) text.clear();
-        it = sources.emplace(id, std::move(text)).first;
-    }
-    const std::u16string& src = it->second;
-    if (src.empty()) return;
-    constexpr size_t npos = std::u16string::npos;
-    // a location in this frame's script, as an offset; |missing| when absent
-    auto offset = [&](v8::Local<v8::Value> where, size_t missing) -> size_t {
-        auto line = get_field(sc, where, "lineNumber");
-        if (!line->IsNumber()) return missing;
-        if (walk.utf8(get_field(sc, where, "scriptId")) != id) return npos;
-        auto column = get_field(sc, where, "columnNumber");
-        return source_offset(src, static_cast<int>(line.As<v8::Number>()->Value()),
-                             column->IsNumber() ? static_cast<int>(column.As<v8::Number>()->Value()) : 0);
-    };
-    bool whole = type == "script" || type == "module";
-    size_t pause = offset(location, npos);
-    size_t start = offset(get_field(sc, scope, "startLocation"), whole ? 0 : npos);
-    size_t end = offset(get_field(sc, scope, "endLocation"), whole ? src.size() : npos);
-    if (pause == npos || start == npos || end == npos || start > pause || pause > end) return;
-    auto object = variables.As<v8::Object>();
-    v8::Local<v8::Array> names;
-    if (!object->GetOwnPropertyNames(sc).ToLocal(&names)) return;
-    for (uint32_t i = 0, n = names->Length(); i < n; i++) {
-        v8::Local<v8::Value> key;
-        if (!names->Get(sc, i).ToLocal(&key) || !key->IsString()) continue;
-        auto key_string = key.As<v8::String>();
-        std::u16string name(key_string->Length(), u'\0');
-        key_string->WriteV2(cap.st.isolate, 0, key_string->Length(), reinterpret_cast<uint16_t *>(name.data()));
-        size_t before = declaration_of(src, start, pause, name);
-        bool pending = before != npos ? statement_end(src, before) >= pause
-                                      : declaration_of(src, pause, end, name) != npos;
-        if (pending) object->Set(sc, key, walk.str(kNotYetDeclared)).Check();
-    }
-}
-
 // Evaluates one capture_on_throw expression in a paused frame, without side
 // effects: V8 refuses anything that would assign, call a non-pure function
 // (an attached Ruby function among them) or run a getter, and stops it after
@@ -2181,7 +2008,6 @@ void capture_record(Capture& cap, const std::string& message)
     if (!frames_v->IsArray()) return;
     auto frames = frames_v.As<v8::Array>();
     auto out_frames = walk.new_array();
-    std::map<std::string, std::u16string> sources; // by scriptId, for mark_not_yet_declared
     bool script_scope_done = false; // top-level let/const: the same in every frame
     for (uint32_t i = 0, n = frames->Length(); i < n && i < kCaptureFrames && !walk.out_of_time(); i++) {
         v8::Local<v8::Value> frame;
@@ -2227,9 +2053,7 @@ void capture_record(Capture& cap, const std::string& message)
                 if (name->IsString())
                     walk.put(out_scope, walk.str("name"), walk.truncated(name.As<v8::String>()));
                 // a scope's variables count as the first level
-                auto variables = walk.object(object.As<v8::Object>(), -1);
-                mark_not_yet_declared(cap, walk, scope, type, location, sources, variables);
-                walk.put(out_scope, walk.str("variables"), variables);
+                walk.put(out_scope, walk.str("variables"), walk.object(object.As<v8::Object>(), -1));
                 walk.put(out_scopes, k++, out_scope);
             }
         }
