@@ -25,6 +25,39 @@
 // i.e., the context that has not been tampered with by user JS
 // convention: $-prefixed identifiers signify objects from the
 // user JS context and should be handled with special care
+// Run in the user's context, before any of its code, when it has a
+// max_memory. Resizable ArrayBuffers and growable SharedArrayBuffers get
+// their memory from V8's process-wide page allocator, which the per-context
+// BudgetAllocator never sees, so new ArrayBuffer(n, {maxByteLength}) could
+// take any amount; V8 has no switch to turn them off. Constructing one is
+// refused instead. Every way to the constructors goes through globalThis
+// or a prototype's constructor property, both replaced here, and the trap
+// keeps its own Reflect.construct, so later changes to globals can't
+// bypass it.
+static const char resizable_buffer_guard_source[] = R"js(
+(() => {
+  'use strict';
+  const construct = Reflect.construct;
+  const define = Object.defineProperty;
+  const guard = (C, name) => {
+    if (typeof C !== 'function') return;
+    const guarded = new Proxy(C, {
+      construct(target, args, newTarget) {
+        const options = args[1];
+        if (options !== null && (typeof options === 'object' || typeof options === 'function') &&
+            options.maxByteLength !== undefined)
+          throw new RangeError(`resizable ${name}s aren't available with max_memory`);
+        return construct(target, args, newTarget);
+      },
+    });
+    define(globalThis, name, {value: guarded, writable: true, configurable: true, enumerable: false});
+    define(C.prototype, 'constructor', {value: guarded, writable: true, configurable: true, enumerable: false});
+  };
+  guard(globalThis.ArrayBuffer, 'ArrayBuffer');
+  guard(globalThis.SharedArrayBuffer, 'SharedArrayBuffer');
+})();
+)js";
+
 static const char safe_context_script_source[] = R"js(
 ;(function($globalThis) {
     const {Map: $Map, Set: $Set} = $globalThis
@@ -121,6 +154,8 @@ struct State
     // used_heap_size at the last GC; max_memory bounds it plus the bytes
     // the ArrayBuffer allocator holds (BudgetAllocator)
     std::atomic<int64_t> heap_used_at_gc;
+    // the last full GC found heap plus ArrayBuffers over max_memory
+    bool over_budget_at_last_full_gc;
     int err_reason;
     // TerminateExecution() while idle doesn't make IsExecutionTerminating() true
     std::atomic<unsigned> terminate_requested;
@@ -630,16 +665,28 @@ struct BudgetAllocator : v8::ArrayBuffer::Allocator
     v8::PageAllocator *GetPageAllocator() final { return inner->GetPageAllocator(); }
 };
 
-void v8_gc_callback(v8::Isolate*, v8::GCType, v8::GCCallbackFlags, void *data)
+void v8_gc_callback(v8::Isolate*, v8::GCType type, v8::GCCallbackFlags, void *data)
 {
     State& st = *static_cast<State*>(data);
     v8::HeapStatistics s;
     st.isolate->GetHeapStatistics(&s);
     int64_t used_heap_size = static_cast<int64_t>(s.used_heap_size());
     st.heap_used_at_gc.store(used_heap_size);
-    // not counting ArrayBuffers here: dead ones are freed after the GC ends
-    if (used_heap_size > st.max_memory)
+    if (used_heap_size > st.max_memory) {
         out_of_memory(st);
+        return;
+    }
+    // The heap grown past what ArrayBuffers already hold: the allocator only
+    // sees new buffers. Dead buffers are freed on another thread after the
+    // GC that found them, so one full GC over budget may be counting garbage;
+    // two in a row are not.
+    if (type & v8::kGCTypeMarkSweepCompact) {
+        auto allocator = static_cast<BudgetAllocator*>(st.allocator.get());
+        bool over = used_heap_size + allocator->used.load() > st.max_memory;
+        if (over && st.over_budget_at_last_full_gc)
+            out_of_memory(st);
+        st.over_budget_at_last_full_gc = over;
+    }
 }
 
 } // namespace anonymous
@@ -1107,20 +1154,33 @@ bool starts_with(const v8_inspector::StringView& v, const char *prefix)
     return true;
 }
 
-// Keeps the first |keep| entries of a Debugger.paused message's callFrames.
-// V8 lists every frame, thousands for a runaway recursion, and only the
-// innermost few are recorded; a linear scan is much cheaper than parsing
-// the rest. Leaves a message that doesn't start as V8's do alone.
-void keep_call_frames(std::string& m, int keep)
+// A Debugger.paused message with only the first |keep| entries of its
+// callFrames, as UTF-8. V8 lists every frame, thousands for a runaway
+// recursion, and only the innermost few are recorded, so this scans V8's
+// string as it is and converts just the parts kept, instead of converting
+// the whole message and parsing frames it would throw away. A message that
+// doesn't start as V8's do is converted whole.
+std::string paused_message_keeping_frames(const v8_inspector::StringView& v, int keep)
 {
     static const char prefix[] = "{\"method\":\"Debugger.paused\",\"params\":{\"callFrames\":[";
-    const size_t n = sizeof(prefix) - 1;
-    if (m.compare(0, n, prefix) != 0) return;
-    size_t cut = std::string::npos;
+    const size_t n = sizeof(prefix) - 1, len = v.length();
+    auto at = [&](size_t i) -> uint16_t {
+        return v.is8Bit() ? v.characters8()[i] : v.characters16()[i];
+    };
+    auto sub = [&](size_t from, size_t count) {
+        return v.is8Bit() ? v8_inspector::StringView(v.characters8() + from, count)
+                          : v8_inspector::StringView(v.characters16() + from, count);
+    };
+    if (len < n)
+        return to_utf8(v);
+    for (size_t i = 0; i < n; i++)
+        if (at(i) != static_cast<unsigned char>(prefix[i]))
+            return to_utf8(v);
+    size_t cut = 0;
     int depth = 0, frames = 0;
     bool in_string = false;
-    for (size_t i = n; i < m.size(); i++) {
-        char c = m[i];
+    for (size_t i = n; i < len; i++) {
+        uint16_t c = at(i);
         if (in_string) {
             if (c == '\\') i++;
             else if (c == '"') in_string = false;
@@ -1131,13 +1191,15 @@ void keep_call_frames(std::string& m, int keep)
         case '{': case '[': depth++; break;
         case '}': case ']':
             if (depth == 0) { // callFrames' closing bracket
-                if (cut != std::string::npos) m.erase(cut, i - cut);
-                return;
+                if (!cut)
+                    return to_utf8(v);
+                return to_utf8(sub(0, cut)) + to_utf8(sub(i, len - i));
             }
             if (--depth == 0 && ++frames == keep) cut = i + 1;
             break;
         }
     }
+    return to_utf8(v);
 }
 
 void CaptureChannel::sendNotification(std::unique_ptr<v8_inspector::StringBuffer> m)
@@ -1149,8 +1211,7 @@ void CaptureChannel::sendNotification(std::unique_ptr<v8_inspector::StringBuffer
     auto v = m->string();
     if (v.length() <= kCapturePauseMessage &&
         starts_with(v, "{\"method\":\"Debugger.paused\"")) {
-        cap.paused = to_utf8(v);
-        keep_call_frames(cap.paused, kCaptureFrames);
+        cap.paused = paused_message_keeping_frames(v, kCaptureFrames);
     }
 }
 
@@ -1531,47 +1592,34 @@ struct CaptureWalk
 
     // own enumerable string-keyed properties, integer keys first as in JS;
     // a debugger scope object's properties are its variables. Integer keys
-    // are probed one by one up to kCaptureItems: listing them would make a
-    // name for every element of a large array-like object, and later ones
-    // aren't shown. The other names are listed in full; they're the
-    // object's own, so the list is at most about the object's size.
+    // are listed as numbers (kKeepNumbers), not strings, so even a large
+    // array-like object's list costs one pointer per element, at most about
+    // the object's own size; only the keys kept become strings.
     v8::Local<v8::Value> object(v8::Local<v8::Object> o, int depth)
     {
         v8::EscapableHandleScope scope(st.isolate);
         auto out = new_object();
         if (stopped) return scope.Escape(out); // out of room: don't list the keys
         uint32_t kept = 0;
-        for (uint32_t j = 0; j <= kCaptureItems && !out_of_time(); j++) {
-            if (!o->HasRealIndexedProperty(context, j).FromMaybe(false)) continue;
-            if (kept == kCaptureItems) {
-                put(out, str("\xE2\x80\xA6"), str("more"));
-                return scope.Escape(out);
-            }
-            v8::Local<v8::Value> val;
-            v8::Local<v8::String> key;
-            bool accessor = false;
-            if (!v8::Integer::NewFromUnsigned(st.isolate, j)->ToString(context).ToLocal(&key) ||
-                !own_value(o, key, &val, &accessor))
-                continue;
-            put(out, key, accessor ? getter() : value(val, depth + 1));
-            kept++;
-        }
         v8::Local<v8::Array> names;
         auto filter = static_cast<v8::PropertyFilter>(v8::ONLY_ENUMERABLE | v8::SKIP_SYMBOLS);
-        if (stopped ||
-            !o->GetPropertyNames(context, v8::KeyCollectionMode::kOwnOnly, filter,
-                                 v8::IndexFilter::kSkipIndices,
-                                 v8::KeyConversionMode::kConvertToString).ToLocal(&names))
+        if (!o->GetPropertyNames(context, v8::KeyCollectionMode::kOwnOnly, filter,
+                                 v8::IndexFilter::kIncludeIndices,
+                                 v8::KeyConversionMode::kKeepNumbers).ToLocal(&names))
             return scope.Escape(out);
         uint32_t n = names->Length();
         for (uint32_t i = 0; i < n; i++) {
             v8::Local<v8::Value> name_v, val;
-            if (!names->Get(context, i).ToLocal(&name_v) || !name_v->IsString()) continue;
+            if (!names->Get(context, i).ToLocal(&name_v)) continue;
             if (kept == kCaptureItems) {
                 put(out, str("\xE2\x80\xA6"), str(std::to_string(n - i) + " more"));
                 break;
             }
-            auto name = name_v.As<v8::String>();
+            v8::Local<v8::String> name; // an index's ToString runs no JavaScript
+            if (name_v->IsString())
+                name = name_v.As<v8::String>();
+            else if (!name_v->IsNumber() || !name_v->ToString(context).ToLocal(&name))
+                continue;
             bool accessor = false;
             if (!own_value(o, name, &val, &accessor)) continue;
             auto key = name;
@@ -2020,6 +2068,13 @@ extern "C" State *v8_thread_init(Context *c, const uint8_t *snapshot_buf,
             // revoke access again now that the script did its one-time setup
             st.safe_context->UseDefaultSecurityToken();
             st.safe_context_function = v8::Local<v8::Function>::Cast(function_v);
+        }
+        if (st.max_memory > 0) {
+            auto source = v8::String::NewFromUtf8Literal(st.isolate, resizable_buffer_guard_source);
+            auto filename = v8::String::NewFromUtf8Literal(st.isolate, "resizable_buffer_guard.js");
+            v8::ScriptOrigin origin(filename);
+            v8::Script::Compile(st.context, source, &origin).ToLocalChecked()
+                ->Run(st.context).ToLocalChecked();
         }
         if (single_threaded) {
             st.persistent_safe_context_function.Reset(st.isolate, st.safe_context_function);

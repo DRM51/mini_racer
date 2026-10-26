@@ -2802,4 +2802,48 @@ class MiniRacerTest < Minitest::Test
     assert_equal 256 << 20,
                  MiniRacer::Context.new.eval("new ArrayBuffer(256 << 20).byteLength")
   end
+
+  def test_max_memory_failures_are_catchable_and_cover_resizable_buffers
+    context = MiniRacer::Context.new(max_memory: 64 << 20)
+    assert_equal "RangeError",
+                 context.eval("try { new ArrayBuffer(1 << 30); 'none' } catch (e) { e.name }")
+    # resizable and growable buffers live outside the budget, so they're refused
+    %w[ArrayBuffer SharedArrayBuffer].each do |name|
+      error =
+        assert_raises(MiniRacer::RuntimeError) do
+          context.eval("new #{name}(8, { maxByteLength: 1 << 30 })")
+        end
+      assert_includes error.message, "aren't available with max_memory"
+    end
+    assert_raises(MiniRacer::RuntimeError) do
+      context.eval("new (new Uint8Array(1).buffer.constructor)(8, { maxByteLength: 64 })")
+    end
+    assert_equal [true, true],
+                 context.eval("const b = new ArrayBuffer(8); [b instanceof ArrayBuffer, b.constructor === ArrayBuffer]")
+    assert MiniRacer::Context.new.eval("new ArrayBuffer(8, { maxByteLength: 64 }).resizable")
+  end
+
+  def test_max_memory_counts_heap_and_buffers_together
+    context = MiniRacer::Context.new(max_memory: 64 << 20)
+    # 56 MB of buffers, then a heap that only goes over the limit with them
+    assert_raises(MiniRacer::V8OutOfMemoryError) do
+      context.eval(<<~JS)
+        const keep = []
+        for (let i = 0; i < 7; i++) keep.push(new Uint8Array(8 << 20))
+        const objs = []
+        for (let i = 0; i < 6; i++) objs.push(new Array(1e6).fill(1.5))
+        for (let j = 0; j < 50; j++) new Array(1e6).fill(2.5)
+      JS
+    end
+    # short-lived buffers alongside a heap don't add up
+    fresh = MiniRacer::Context.new(max_memory: 64 << 20)
+    assert_equal 2000 * (4 << 20),
+                 fresh.eval(<<~JS)
+                   const keep = []
+                   for (let i = 0; i < 4; i++) keep.push(new Array(1e6).fill(1.5))
+                   let t = 0
+                   for (let i = 0; i < 2000; i++) t += new Uint8Array(4 << 20).length
+                   t
+                 JS
+  end
 end
