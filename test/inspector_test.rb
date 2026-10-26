@@ -1057,9 +1057,13 @@ class MiniRacerInspectorTest < Minitest::Test
     ctx = new_context(inspector: "idle-timeout", timeout: 300)
     client = connect("idle-timeout")
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    client.send_text(JSON.generate(id: 9, method: "Runtime.evaluate", params: { expression: "for (;;) {}" }))
+    # two queued together: each gets its own 300 ms, not one between them
+    [9, 10].each do |id|
+      client.send_text(JSON.generate(id: id, method: "Runtime.evaluate", params: { expression: "for (;;) {}" }))
+    end
     client.wait_response(9, timeout: 5)
-    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 3
+    client.wait_response(10, timeout: 5)
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 4
     assert_equal 2, ctx.eval("1 + 1") # and the termination doesn't leak into the next eval
   end
 

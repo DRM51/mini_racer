@@ -745,6 +745,36 @@ class MiniRacerCaptureTest < Minitest::Test
     end
   end
 
+  def test_the_identifier_check_ignores_the_locale
+    skip "no ru_RU.CP1251 locale" unless `locale -a 2>/dev/null`.include?("ru_RU.CP1251")
+    # there, the bytes of U+2000 (E2 80 80) are letters to isalnum. A guard,
+    # not a proof: before the explicit ASCII ranges the probe called F just
+    # once more (the recursion guard stops the rest), which a side-effect-free
+    # evaluation can't count
+    script = <<~'RUBY'
+      require "mini_racer"
+      expressions = Array.new(20) { |i| "new\u2000F#{" " * i}" }
+      ctx = MiniRacer::Context.new(capture_on_throw: { expressions: expressions })
+      begin
+        ctx.eval(<<~JS)
+          function inner() {
+            function F() { throw new ReferenceError("new\u2000F is not defined") }
+            throw new Error(typeof F)
+          }
+          inner()
+        JS
+      rescue MiniRacer::RuntimeError => e
+        errors = e.capture["expressions"].map { _1["error"] }.uniq
+        warn errors.inspect unless errors == ["ReferenceError: new\u2000F is not defined"]
+        exit!(errors == ["ReferenceError: new\u2000F is not defined"] ? 0 : 1)
+      end
+      exit!(1)
+    RUBY
+    env = { "LC_ALL" => "ru_RU.CP1251" }
+    _, err, status = Open3.capture3(env, RbConfig.ruby, "-I", File.expand_path("../lib", __dir__), "-e", script)
+    assert status.success?, err
+  end
+
   def test_uncaught_exceptions_are_not_printed
     script = <<~RUBY
       require "mini_racer"

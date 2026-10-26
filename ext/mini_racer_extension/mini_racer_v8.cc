@@ -956,8 +956,9 @@ void inspector_create(Inspector& in)
     in.inspector->contextCreated(info);
 }
 
-// Runs every queued frontend event. Returns whether there were any.
-bool inspector_drain(Inspector& in)
+// Runs every queued frontend event, or with |one| only the next. Returns
+// whether there were any.
+bool inspector_drain(Inspector& in, bool one = false)
 {
     bool any = false;
     std::string msg;
@@ -1036,6 +1037,8 @@ bool inspector_drain(Inspector& in)
         case mri::Event::None:
             break;
         }
+        if (one)
+            break;
     }
     return any;
 }
@@ -1799,8 +1802,12 @@ bool names_undefined_identifier(const std::string& error, const std::string& exp
         "do", "else", "enum", "export", "extends", "false", "finally", "for", "function", "if", "import",
         "in", "instanceof", "let", "new", "null", "return", "static", "super", "switch", "this", "throw",
         "true", "try", "typeof", "var", "void", "while", "with", "yield"};
-    auto ascii_ident = [](unsigned char c) { return std::isalnum(c) || c == '_' || c == '$'; };
-    if (name.empty() || std::isdigit(static_cast<unsigned char>(name[0])) ||
+    // explicit ranges: isalnum follows the locale, and in some a byte of
+    // U+2000's UTF-8 is a letter
+    auto ascii_ident = [](unsigned char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$';
+    };
+    if (name.empty() || (name[0] >= '0' && name[0] <= '9') ||
         !std::all_of(name.begin(), name.end(), ascii_ident) ||
         std::any_of(std::begin(reserved), std::end(reserved), [&](const char *w) { return name == w; }))
         return false;
@@ -3238,17 +3245,18 @@ extern "C" void v8_cancel_terminate_execution(State *pst)
     pst->isolate->CancelTerminateExecution();
 }
 
-extern "C" void v8_inspector_dispatch(State *pst)
+extern "C" int v8_inspector_dispatch(State *pst)
 {
     State& st = *pst;
     Inspector *in = st.inspector.get();
     if (!in || !in->target)
-        return;
+        return 0;
     v8::HandleScope handle_scope(st.isolate);
     st.inspector_idle = true;
     inspector_drop_session_if_safe(*in);
-    inspector_drain(*in);
+    bool any = inspector_drain(*in, true); // one, under its own watchdog
     st.inspector_idle = false;
+    return any;
 }
 
 extern "C" void v8_inspector_shutdown(State *pst)
