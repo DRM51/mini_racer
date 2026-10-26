@@ -932,7 +932,13 @@ class MiniRacerTest < Minitest::Test
       big = Random.new(1).bytes(25 << 20).unpack1("H*")
       before = rss_mb
       # each call serializes 50 MB before the conversion raises
-      20.times { context.call("echo", big, Date.new(2026, 10, 26)) rescue nil }
+      raised = 0
+      20.times do
+        context.call("echo", big, Date.new(2026, 10, 26))
+      rescue ArgumentError => e
+        raised += 1 if e.message == "no dates today"
+      end
+      abort "the conversion didn't raise each time (#{raised})" unless raised == 20
       grown = rss_mb - before
       warn "grew #{grown} MB" if grown >= 300
       exit!(grown < 300 ? 0 : 1)
