@@ -30,6 +30,9 @@ void v8_get_flags(char **p, size_t *n);
 void v8_thread_main(struct Context *c, struct State *pst);
 void v8_dispatch(struct Context *c);
 int v8_reply(struct Context *c, const uint8_t *p, size_t n); // 0 or < 0, see serde.c
+int v8_reply_snapshot(struct Context *c, const uint8_t *p, size_t n); // a heap snapshot: up to 1 GiB
+size_t v8_value_limit(struct Context *c); // the largest value v8_reply takes
+const char *v8_size_label(size_t n); // "512 MiB", for messages
 void v8_roundtrip(struct Context *c, const uint8_t **p, size_t *n);
 void v8_inspector_wake(struct Context *c); // any thread; wakes an idle v8 thread
 void v8_inspector_paused(struct Context *c, int paused); // v8 thread

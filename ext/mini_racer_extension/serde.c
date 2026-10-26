@@ -43,6 +43,7 @@ static void des_error_end(void *arg);
 typedef struct Buf {
     uint8_t *buf;
     uint32_t len, cap;
+    uint32_t max; // the most it may hold, at most BUF_MAX; see buf_init
     uint8_t buf_s[48];
 } Buf;
 
@@ -62,6 +63,23 @@ enum {
     BUF_NO_MEMORY = -2,
 };
 
+// "1 GiB", "512 MiB", "512 MB" or "1234 bytes", whichever states |n|
+// exactly, for error messages; a static buffer per thread
+static const char *size_label(size_t n)
+{
+    static _Thread_local char buf[32];
+
+    if (n && n % ((size_t)1 << 30) == 0)
+        snprintf(buf, sizeof(buf), "%zu GiB", n >> 30);
+    else if (n && n % ((size_t)1 << 20) == 0)
+        snprintf(buf, sizeof(buf), "%zu MiB", n >> 20);
+    else if (n && n % 1000000 == 0)
+        snprintf(buf, sizeof(buf), "%zu MB", n / 1000000);
+    else
+        snprintf(buf, sizeof(buf), "%zu bytes", n);
+    return buf;
+}
+
 // note: returns |v| if v in [0,1,2]; |v| must be at most 2^63
 static inline uint64_t next_power_of_two(uint64_t v) {
   v -= 1;
@@ -80,6 +98,7 @@ static inline void buf_init(Buf *b)
     b->len = 0;
     b->buf = b->buf_s;
     b->cap = sizeof(b->buf_s);
+    b->max = BUF_MAX;
 }
 
 static inline void buf_reset(Buf *b)
@@ -105,12 +124,14 @@ static inline int buf_grow(Buf *b, size_t n)
 {
     void *p;
 
-    if (n > BUF_MAX || b->len > BUF_MAX - n)
+    if (n > b->max || b->len > b->max - n)
         return BUF_TOO_LARGE;
     n += b->len;
     if (n < b->cap)
         return 0;
-    n = next_power_of_two(n); // BUF_MAX is a power of two, so n <= BUF_MAX
+    n = next_power_of_two(n); // at most 2 * b->max <= 2 GiB: no overflow
+    if (n > b->max)
+        n = b->max; // still >= what's needed, checked above
     p = NULL;
     if (b->buf != b->buf_s)
         p = b->buf;
@@ -150,7 +171,8 @@ static inline void w(Ser *s, const void *p, size_t n)
         return;
     r = buf_put(&s->b, p, n);
     if (r == BUF_TOO_LARGE)
-        snprintf(s->err, sizeof(s->err), "serialized value too large (over 1 GiB)");
+        snprintf(s->err, sizeof(s->err), "serialized value too large (over %s)",
+                 size_label(s->b.max));
     else if (r)
         snprintf(s->err, sizeof(s->err), "out of memory");
 }

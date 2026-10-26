@@ -137,6 +137,7 @@ typedef struct Context
     int verbose_exceptions;
     int ser_opts;      // SER_* flags, set by Context.new(date:, decimal:)
     int64_t idle_gc, max_memory, timeout;
+    int64_t max_value_size; // Context.new(max_value_size:); 0 = follow max_memory
     struct State *pst; // used by v8 thread
     VALUE procs;       // array of js -> ruby callbacks
     VALUE exception;   // pending exception or Qnil
@@ -184,6 +185,19 @@ typedef struct Context
     char inspector_target_id[64]; // set by the v8 thread before late_init
     int inspector_detach_terminates; // Context.new(inspector_detach: :terminate)
 } Context;
+
+// The largest value one eval, call or callback may pass between Ruby and
+// JavaScript, serialized: Context.new(max_value_size:) if given, else the
+// context's max_memory if it has one, never more than BUF_MAX (1 GiB).
+// Heap snapshots and Snapshot requests aren't values.
+static size_t value_limit(const Context *c)
+{
+    if (c->max_value_size > 0)
+        return (uint64_t)c->max_value_size < BUF_MAX ? (size_t)c->max_value_size : BUF_MAX;
+    if (c->max_memory > 0 && (uint64_t)c->max_memory < BUF_MAX)
+        return (size_t)c->max_memory;
+    return BUF_MAX;
+}
 
 typedef struct Snapshot {
     VALUE blob;
@@ -1298,17 +1312,39 @@ int v8_context_quitting(Context *c)
 }
 
 // Returns 0, or BUF_TOO_LARGE or BUF_NO_MEMORY with the reply discarded, so
-// Ruby never reads part of one.
-int v8_reply(Context *c, const uint8_t *p, size_t n)
+// Ruby never reads part of one. A value over value_limit() is refused; a
+// heap snapshot (|snapshot|) may take up to BUF_MAX.
+static int v8_reply1(Context *c, const uint8_t *p, size_t n, int snapshot)
 {
     int r;
 
     pthread_mutex_lock(&c->mtx);
+    c->res.max = snapshot ? BUF_MAX : value_limit(c);
     r = buf_put(&c->res, p, n);
     if (r)
         buf_reset(&c->res);
     pthread_mutex_unlock(&c->mtx);
     return r;
+}
+
+int v8_reply(Context *c, const uint8_t *p, size_t n)
+{
+    return v8_reply1(c, p, n, 0);
+}
+
+int v8_reply_snapshot(Context *c, const uint8_t *p, size_t n)
+{
+    return v8_reply1(c, p, n, 1);
+}
+
+size_t v8_value_limit(Context *c)
+{
+    return value_limit(c);
+}
+
+const char *v8_size_label(size_t n)
+{
+    return size_label(n);
 }
 
 static void v8_once_init(void)
@@ -1456,6 +1492,7 @@ static void *rendezvous_callback(void *arg)
         goto fail;
     }
     ser_init1(&s, 'c'); // callback reply
+    s.b.max = value_limit(c);
     args.ser = &s;
     args.value = r;
     args.opts = c->ser_opts;
@@ -2098,6 +2135,7 @@ static VALUE context_attach(VALUE self, VALUE name, VALUE proc)
         rb_raise(runtime_error, "too many callbacks");
     // request is (A)ttach, [name, id] array
     ser_init1(&s, 'A');
+    s.b.max = value_limit(c);
     ser_array_begin(&s, 2);
     add_string(&s, name);
     ser_int(&s, id);
@@ -2317,6 +2355,7 @@ static VALUE context_call_common(int argc, VALUE *argv, VALUE self, char op)
     rb_ary_unshift(args, name);
     // request is (C)all or (D) call_await, [name, args...] array
     ser_init1(&s, op);
+    s.b.max = value_limit(c);
     if (serialize(&s, args, c->ser_opts)) {
         ser_reset(&s);
         rb_raise(runtime_error, "Context.call: %s", s.err);
@@ -2355,6 +2394,7 @@ static VALUE context_eval_common(int argc, VALUE *argv, VALUE self, char op)
     Check_Type(filename, T_STRING);
     // request is (E)val or (F) eval_await, [filename, source] array
     ser_init1(&s, op);
+    s.b.max = value_limit(c);
     ser_array_begin(&s, 2);
     add_string(&s, filename);
     add_string(&s, source);
@@ -2691,6 +2731,15 @@ static VALUE context_initialize(int argc, VALUE *argv, VALUE self)
             c->max_memory = FIX2LONG(v);
             if (c->max_memory < 0 || c->max_memory >= UINT32_MAX)
                 rb_raise(rb_eArgError, "bad max_memory");
+        } else if (!strcmp(s, "max_value_size")) {
+            if (NIL_P(v)) {
+                c->max_value_size = 0;
+                continue;
+            }
+            Check_Type(v, T_FIXNUM);
+            c->max_value_size = FIX2LONG(v);
+            if (c->max_value_size < 1 || (uint64_t)c->max_value_size > BUF_MAX)
+                rb_raise(rb_eArgError, "bad max_value_size: 1 to 1 GiB (1073741824) bytes");
         } else if (!strcmp(s, "marshal_stack_depth")) { // backcompat, ignored
             Check_Type(v, T_FIXNUM);
         } else if (!strcmp(s, "timeout")) {

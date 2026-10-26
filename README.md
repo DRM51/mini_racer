@@ -186,9 +186,13 @@ It doesn't cover:
   `context.eval("delete globalThis.WebAssembly")`, or cap each memory
   process-wide with `MiniRacer::Platform.set_flags!("--wasm-max-mem-pages=N")`
   (64 KiB pages).
-- The copy of a value passed between Ruby and JavaScript. Each is limited to
-  1 GiB serialized (V8's buffer for one can reach 2 GiB before it's refused);
-  larger values raise `MiniRacer::RuntimeError`.
+- The copy of a value passed between Ruby and JavaScript. Each value is
+  limited, serialized, to the context's `max_memory` (1 GiB without one, and
+  never more); `Context.new(max_value_size: bytes)` sets the limit directly,
+  up to 1 GiB. A larger value raises `MiniRacer::RuntimeError` ("serialized
+  value too large (over 512 MB)", or, from JavaScript, "RangeError: value
+  too large to return to Ruby (over 512 MB)"), naming the limit in force.
+  V8's buffer for a value can reach twice the limit before it's refused.
 - Ruby objects made from JavaScript results.
 
 To bound everything, run untrusted scripts in a separate process with an OS

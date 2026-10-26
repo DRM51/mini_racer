@@ -193,24 +193,25 @@ namespace {
 // not safe to destroy after main() returns
 v8::Platform *platform;
 
-// v8_reply takes at most 1 GiB. V8 asks for about twice what it needs when
-// its buffer grows, so stopping it at 2 GiB bounds the memory a value like
-// Array(1e6).fill(bigString) can take without refusing anything v8_reply
-// would accept.
-constexpr size_t kMaxSerializerBuffer = (size_t{2} << 30) + 64;
-
+// v8_reply takes at most v8_value_limit() bytes (max_value_size:, else
+// max_memory, never over 1 GiB). V8 asks for about twice what it needs when
+// its buffer grows, so stopping it at twice the limit bounds the memory a
+// value like Array(1e6).fill(bigString) can take without refusing anything
+// v8_reply would accept.
 struct SerializerDelegate : v8::ValueSerializer::Delegate
 {
     v8::Isolate *isolate;
+    size_t limit; // v8_value_limit()
     bool refused = false;
 
-    explicit SerializerDelegate(v8::Isolate *isolate) : isolate(isolate) {}
+    SerializerDelegate(v8::Isolate *isolate, size_t limit) : isolate(isolate), limit(limit) {}
 
     void ThrowDataCloneError(v8::Local<v8::String> message) final
     {
         if (refused) {
-            message = v8::String::NewFromUtf8Literal(
-                isolate, "value too large to return to Ruby (over 1 GiB)");
+            std::string text = std::string("value too large to return to Ruby (over ") +
+                               v8_size_label(limit) + ")";
+            message = v8::String::NewFromUtf8(isolate, text.c_str()).ToLocalChecked();
             isolate->ThrowException(v8::Exception::RangeError(message));
             return;
         }
@@ -219,7 +220,7 @@ struct SerializerDelegate : v8::ValueSerializer::Delegate
 
     void *ReallocateBufferMemory(void *old_buffer, size_t size, size_t *actual_size) final
     {
-        if (size > kMaxSerializerBuffer) {
+        if (size > 2 * limit + 64) {
             refused = true;
             return nullptr; // V8 keeps |old_buffer| and throws a DataCloneError
         }
@@ -241,7 +242,7 @@ struct Serialized
 
     Serialized(State& st, v8::Local<v8::Value> v)
     {
-        SerializerDelegate delegate(st.isolate);
+        SerializerDelegate delegate(st.isolate, v8_value_limit(st.ruby_context));
         v8::ValueSerializer ser(st.isolate, &delegate);
         ser.WriteHeader();
         if (!ser.WriteValue(st.context, v).FromMaybe(false)) return; // exception pending
@@ -262,9 +263,11 @@ bool send_reply(State& st, const uint8_t *p, size_t n)
 {
     int r = v8_reply(st.ruby_context, p, n);
     if (!r) return true;
-    auto message = r == -1
-        ? v8::String::NewFromUtf8Literal(st.isolate, "value too large to return to Ruby (over 1 GiB)")
-        : v8::String::NewFromUtf8Literal(st.isolate, "out of memory returning a value to Ruby");
+    std::string text = r == -1
+        ? std::string("value too large to return to Ruby (over ") +
+              v8_size_label(v8_value_limit(st.ruby_context)) + ")"
+        : std::string("out of memory returning a value to Ruby");
+    auto message = v8::String::NewFromUtf8(st.isolate, text.c_str()).ToLocalChecked();
     st.isolate->ThrowException(v8::Exception::RangeError(message));
     return false;
 }
@@ -2570,8 +2573,9 @@ extern "C" void v8_heap_snapshot(State *pst)
     OutputStream os;
     snapshot->Serialize(&os, v8::HeapSnapshot::kJSON);
     const_cast<v8::HeapSnapshot*>(snapshot)->Delete();
-    // not serialized because big; Ruby raises if v8_reply refuses it
-    v8_reply(st.ruby_context, os.buf.data(), os.buf.size());
+    // not serialized because big; Ruby raises if v8_reply refuses it. A
+    // heap snapshot isn't a value: 1 GiB, whatever max_memory is
+    v8_reply_snapshot(st.ruby_context, os.buf.data(), os.buf.size());
 }
 
 extern "C" void v8_perform_microtask_checkpoint(State *pst)

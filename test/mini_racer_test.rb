@@ -2792,6 +2792,33 @@ class MiniRacerTest < Minitest::Test
     assert_equal 5, context.eval("inner()")
   end
 
+  def test_values_are_limited_to_max_memory_or_max_value_size
+    mib = "x" * (1 << 20)
+    context = MiniRacer::Context.new(max_memory: 16 << 20)
+    context.eval("function count(a) { return a.length }")
+    # 30 references to one 1 MiB string: 30 MiB serialized, a small heap
+    error = assert_raises(MiniRacer::RuntimeError) { context.call("count", [mib] * 30) }
+    assert_includes error.message, "serialized value too large (over 16 MiB)"
+    error =
+      assert_raises(MiniRacer::RuntimeError) do
+        context.eval("const mib = 'x'.repeat(1 << 20); Array(30).fill(mib)")
+      end
+    assert_includes error.message, "value too large to return to Ruby (over 16 MiB)"
+    context.attach("big", -> { [mib] * 30 })
+    assert_includes context.eval("try { big(); 'none' } catch (e) { String(e) }"),
+                    "serialized value too large (over 16 MiB)"
+    assert_equal 10, context.call("count", [mib] * 10)
+    # max_value_size sets it directly, here below max_memory
+    tight = MiniRacer::Context.new(max_memory: 64 << 20, max_value_size: 4_000_000)
+    tight.eval("function count(a) { return a.length }")
+    error = assert_raises(MiniRacer::RuntimeError) { tight.call("count", [mib] * 5) }
+    assert_includes error.message, "(over 4 MB)"
+    # without max_memory the limit is 1 GiB
+    assert_equal 30, MiniRacer::Context.new.tap { |c| c.eval("function count(a) { return a.length }") }.call("count", [mib] * 30)
+    assert_raises(ArgumentError) { MiniRacer::Context.new(max_value_size: 0) }
+    assert_raises(ArgumentError) { MiniRacer::Context.new(max_value_size: (1 << 30) + 1) }
+  end
+
   def test_max_memory_bounds_array_buffers
     context = MiniRacer::Context.new(max_memory: 64 << 20)
     # one buffer over the limit, and many that together are
