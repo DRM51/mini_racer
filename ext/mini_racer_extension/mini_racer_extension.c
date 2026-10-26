@@ -146,6 +146,7 @@ typedef struct Context
     Buf v8_req;        // stable v8-side copy of a request returned by v8_roundtrip
     int res_ready;     // protected by |mtx|; response may be filled before ready
     Buf snapshot;
+    Buf capture_expressions; // Context.new(capture_on_throw: {expressions:}), NUL-separated
     pthread_t single_threaded_thr;
     pid_t single_threaded_pid;
     int single_threaded_thr_started;
@@ -1360,7 +1361,8 @@ static void *v8_thread_start(void *arg)
     barrier_wait(&c->early_init);
     v8_once_init();
     v8_thread_init(c, c->snapshot.buf, c->snapshot.len, c->max_memory, c->verbose_exceptions,
-                   c->inspector ? c->inspector_title : NULL, c->capture_on_throw);
+                   c->inspector ? c->inspector_title : NULL, c->capture_on_throw,
+                   (const char *)c->capture_expressions.buf, c->capture_expressions.len);
     while (c->quit < 2)
         pthread_cond_wait(&c->cv, &c->mtx);
     context_destroy(c);
@@ -1963,6 +1965,7 @@ static VALUE context_alloc(VALUE klass)
     c->procs = rb_ary_new();
     c->max_pause = 10*60*1000;
     buf_init(&c->snapshot);
+    buf_init(&c->capture_expressions);
     buf_init(&c->req);
     buf_init(&c->res);
     buf_init(&c->v8_req);
@@ -2078,6 +2081,7 @@ static void context_free(void *arg)
 static void context_abandon(Context *c)
 {
     buf_reset(&c->snapshot);
+    buf_reset(&c->capture_expressions);
     buf_reset(&c->req);
     buf_reset(&c->res);
     buf_reset(&c->v8_req);
@@ -2096,6 +2100,7 @@ static void context_destroy(Context *c)
     pthread_mutex_destroy(&c->pw.mtx);
     pthread_cond_destroy(&c->pw.cv);
     buf_reset(&c->snapshot);
+    buf_reset(&c->capture_expressions);
     buf_reset(&c->req);
     buf_reset(&c->res);
     buf_reset(&c->v8_req);
@@ -2636,6 +2641,45 @@ out:
         rb_thread_lock_native_thread();
 }
 
+// capture_on_throw: {expressions: [...]}: JavaScript to evaluate, side-effect
+// free, in the failing frame. Returns them as one Ruby string, NUL-separated,
+// or nil; context_initialize copies it into the Context only once no other
+// option can raise, so a rejected Context.new leaks nothing.
+static VALUE capture_expressions_option(VALUE opts)
+{
+    VALUE exprs, e, joined;
+    long i, n;
+
+    exprs = rb_hash_lookup(opts, ID2SYM(rb_intern("expressions")));
+    if ((long)rb_hash_size_num(opts) != (NIL_P(exprs) ? 0 : 1))
+        rb_raise(rb_eArgError, "capture_on_throw: the only option is expressions:");
+    if (NIL_P(exprs))
+        return Qnil;
+    if (!RB_TYPE_P(exprs, T_ARRAY))
+        rb_raise(rb_eArgError, "capture_on_throw: expressions: must be an array of strings");
+    n = RARRAY_LEN(exprs);
+    if (n > 20)
+        rb_raise(rb_eArgError, "capture_on_throw: at most 20 expressions");
+    joined = rb_str_buf_new(0);
+    for (i = 0; i < n; i++) {
+        e = rb_ary_entry(exprs, i);
+        if (!RB_TYPE_P(e, T_STRING))
+            rb_raise(rb_eArgError, "capture_on_throw: expressions: must be an array of strings");
+        // rb_str_conv_enc returns the string unconverted when it can't convert
+        if (rb_enc_str_coderange(e) == ENC_CODERANGE_BROKEN)
+            rb_raise(rb_eArgError, "capture_on_throw: expression %ld is not valid in its encoding", i);
+        e = rb_str_conv_enc(e, rb_enc_get(e), rb_utf8_encoding());
+        if (rb_enc_get(e) != rb_utf8_encoding() && rb_enc_str_coderange(e) != ENC_CODERANGE_7BIT)
+            rb_raise(rb_eArgError, "capture_on_throw: expression %ld can't be converted to UTF-8", i);
+        if (RSTRING_LEN(e) < 1 || RSTRING_LEN(e) > 1000 ||
+            memchr(RSTRING_PTR(e), '\0', RSTRING_LEN(e)))
+            rb_raise(rb_eArgError, "capture_on_throw: each expression must be 1 to 1000 bytes, without NUL");
+        rb_str_buf_cat(joined, RSTRING_PTR(e), RSTRING_LEN(e));
+        rb_str_buf_cat(joined, "", 1);
+    }
+    return joined;
+}
+
 static void set_inspector_title(Context *c, VALUE title)
 {
     long n;
@@ -2657,7 +2701,7 @@ static void set_inspector_title(Context *c, VALUE title)
 
 static VALUE context_initialize(int argc, VALUE *argv, VALUE self)
 {
-    VALUE kwargs, a, k, v;
+    VALUE kwargs, a, k, v, capture_expressions = Qnil;
     pthread_attr_t attr;
     const char *cause;
     pthread_t thr;
@@ -2744,6 +2788,8 @@ static VALUE context_initialize(int argc, VALUE *argv, VALUE self)
                 rb_raise(rb_eArgError, "bad inspector_detach: expected :resume or :terminate");
         } else if (!strcmp(s, "capture_on_throw")) {
             c->capture_on_throw = !(v == Qfalse || v == Qnil);
+            if (RB_TYPE_P(v, T_HASH))
+                capture_expressions = capture_expressions_option(v);
             if (c->capture_on_throw && single_threaded)
                 rb_raise(rb_eArgError, "capture_on_throw is not supported in single_threaded mode");
         } else {
@@ -2753,10 +2799,15 @@ static VALUE context_initialize(int argc, VALUE *argv, VALUE self)
     // both would drive V8's one pause-on-exceptions setting
     if (c->inspector && c->capture_on_throw)
         rb_raise(rb_eArgError, "capture_on_throw can't be combined with inspector");
+    if (!NIL_P(capture_expressions) &&
+        buf_put(&c->capture_expressions, RSTRING_PTR(capture_expressions),
+                RSTRING_LEN(capture_expressions)))
+        rb_raise(runtime_error, "out of memory");
+    RB_GC_GUARD(capture_expressions);
 init:
     if (single_threaded) {
         v8_once_init();
-        c->pst = v8_thread_init(c, c->snapshot.buf, c->snapshot.len, c->max_memory, c->verbose_exceptions, NULL, 0);
+        c->pst = v8_thread_init(c, c->snapshot.buf, c->snapshot.len, c->max_memory, c->verbose_exceptions, NULL, 0, NULL, 0);
     } else {
         cause = "pthread_attr_init";
         if ((r = pthread_attr_init(&attr)))
