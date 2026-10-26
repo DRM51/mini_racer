@@ -97,11 +97,23 @@ context.call("echo", BigDecimal("12.34"))      # => 12.34
 
 - `date: :iso` passes a date-only `Date` as an ISO 8601 string (`Date#iso8601`)
   instead of local midnight, so the calendar day does not depend on the
-  server's timezone. `DateTime` and `Time` are still JavaScript `Date`s. The
-  default is `date: :time`.
+  server's timezone. A year before 0 or after 9999 takes ECMAScript's expanded
+  form (`"+012345-06-07"`, `"-000050-01-01"`), which `new Date()` can parse.
+  `DateTime` and `Time` are still JavaScript `Date`s. The default is
+  `date: :time`.
 - `decimal: :float` passes a `BigDecimal` as a JavaScript number (`to_f`),
-  which can lose precision. By default a `BigDecimal` becomes the string
+  which keeps about 15 significant digits: `BigDecimal("12345678901234567890.5")`
+  arrives as `12345678901234567000`.
+- `decimal: :string` passes a `BigDecimal` as its exact digits instead
+  (`"12345678901234567890.5"`, `"-0.5"`, `"12.0"`, `"NaN"`), for scripts that
+  need every digit. Past 1000 digits either side of the point it uses the
+  scientific form (`"0.1e1002"`), so a huge exponent can't make a huge string.
+- Without a `decimal:` option a `BigDecimal` becomes the string
   `"Undefined Conversion"`, like other unsupported objects.
+- `MiniRacer::CONVERSIONS` lists the values this build accepts,
+  `{date: [:time, :iso], decimal: [:float, :string]}`, so a caller can check
+  for an option rather than the version. It isn't defined on TruffleRuby,
+  which doesn't support these options.
 
 Ruby `Integer` and JavaScript `BigInt` values are converted exactly up to a
 16 MiB magnitude (about 134 million bits). Larger individual values are

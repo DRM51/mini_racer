@@ -675,9 +675,46 @@ static int serialize_bigint(Ser *s, VALUE v)
 
 // how serialize() hands JS the Ruby values that have no exact JS type
 enum {
-    SER_DATE_ISO      = 1, // Date (not DateTime) as "YYYY-MM-DD", not a JS Date
-    SER_DECIMAL_FLOAT = 2, // BigDecimal as a number, not "Undefined Conversion"
+    SER_DATE_ISO       = 1, // Date (not DateTime) as "YYYY-MM-DD", not a JS Date
+    SER_DECIMAL_FLOAT  = 2, // BigDecimal as a number, not "Undefined Conversion"
+    SER_DECIMAL_STRING = 4, // BigDecimal as its exact digits, "-12.5", "NaN"
+    SER_DECIMAL        = SER_DECIMAL_FLOAT | SER_DECIMAL_STRING,
 };
+
+// Date#iso8601, except that a year outside 0000-9999 takes ECMAScript's
+// expanded form, a sign and six digits ("+012345-01-01", "-000050-01-01"),
+// the only form new Date() parses for such years
+static void add_iso_date(Ser *s, VALUE v)
+{
+    VALUE y = rb_funcall(v, rb_intern("year"), 0);
+    char buf[64];
+    int n;
+
+    if (FIXNUM_P(y) && (FIX2LONG(y) < 0 || FIX2LONG(y) > 9999)) {
+        n = snprintf(buf, sizeof(buf), "%+07ld-%02d-%02d", FIX2LONG(y),
+                     NUM2INT(rb_funcall(v, rb_intern("mon"), 0)),
+                     NUM2INT(rb_funcall(v, rb_intern("mday"), 0)));
+        ser_string(s, buf, n);
+        return;
+    }
+    add_string(s, rb_funcall(v, rb_intern("iso8601"), 0));
+}
+
+// BigDecimal#to_s("F"), plain notation ("12345678901234567890.123456789"),
+// unless the digits would reach past 1000 places either side of the point:
+// then the default scientific form ("0.1e1001"), so an exponent of a billion
+// can't become a billion-character string
+static void add_decimal_string(Ser *s, VALUE v)
+{
+    long long e = NUM2LL(rb_funcall(v, rb_intern("exponent"), 0));
+    VALUE t;
+
+    if (e > 1000 || e < -1000)
+        t = rb_funcall(v, rb_intern("to_s"), 0);
+    else
+        t = rb_funcall(v, rb_intern("to_s"), 1, rb_str_new_cstr("F"));
+    add_string(s, t);
+}
 
 static int serialize1(Ser *s, VALUE refs, VALUE v, int depth, int opts)
 {
@@ -754,16 +791,19 @@ static int serialize1(Ser *s, VALUE refs, VALUE v, int depth, int opts)
             if (opts & SER_DATE_ISO) {
                 // a calendar day; to_time would make it local midnight,
                 // which is the previous day in UTC east of Greenwich
-                add_string(s, rb_funcall(v, rb_intern("iso8601"), 0));
+                add_iso_date(s, v);
                 break;
             }
             v = rb_funcall(v, rb_intern("to_time"), 0);
-        } else if (opts & SER_DECIMAL_FLOAT) {
+        } else if (opts & SER_DECIMAL) {
             if (NIL_P(big_decimal_class) && rb_const_defined(rb_cObject, rb_intern("BigDecimal")))
                 big_decimal_class = rb_const_get(rb_cObject, rb_intern("BigDecimal"));
             // the exact class, like Date above: a subclass's to_f isn't ours to run
             if (!NIL_P(big_decimal_class) && CLASS_OF(v) == big_decimal_class) {
-                ser_num(s, NUM2DBL(rb_funcall(v, rb_intern("to_f"), 0)));
+                if (opts & SER_DECIMAL_STRING)
+                    add_decimal_string(s, v);
+                else
+                    ser_num(s, NUM2DBL(rb_funcall(v, rb_intern("to_f"), 0)));
                 break;
             }
         }
@@ -2760,11 +2800,13 @@ static VALUE context_initialize(int argc, VALUE *argv, VALUE self)
             else if (!NIL_P(v) && v != ID2SYM(rb_intern("time")))
                 rb_raise(rb_eArgError, "bad date: expected :time or :iso");
         } else if (!strcmp(s, "decimal")) {
-            c->ser_opts &= ~SER_DECIMAL_FLOAT;
+            c->ser_opts &= ~SER_DECIMAL;
             if (v == ID2SYM(rb_intern("float")))
                 c->ser_opts |= SER_DECIMAL_FLOAT;
+            else if (v == ID2SYM(rb_intern("string")))
+                c->ser_opts |= SER_DECIMAL_STRING;
             else if (!NIL_P(v))
-                rb_raise(rb_eArgError, "bad decimal: expected :float or nil");
+                rb_raise(rb_eArgError, "bad decimal: expected :float, :string or nil");
         } else if (!strcmp(s, "verbose_exceptions")) {
             c->verbose_exceptions = !(v == Qfalse || v == Qnil);
         } else if (!strcmp(s, "max_pause")) {
@@ -2973,6 +3015,16 @@ void Init_mini_racer_extension(void)
     VALUE c, m;
 
     m = rb_define_module("MiniRacer");
+    // what Context.new(date:, decimal:) accepts besides nil, for callers to
+    // ask this build instead of reading its version
+    {
+        VALUE h = rb_hash_new(), a;
+        a = rb_ary_new_from_args(2, ID2SYM(rb_intern("time")), ID2SYM(rb_intern("iso")));
+        rb_hash_aset(h, ID2SYM(rb_intern("date")), rb_obj_freeze(a));
+        a = rb_ary_new_from_args(2, ID2SYM(rb_intern("float")), ID2SYM(rb_intern("string")));
+        rb_hash_aset(h, ID2SYM(rb_intern("decimal")), rb_obj_freeze(a));
+        rb_define_const(m, "CONVERSIONS", rb_obj_freeze(h));
+    }
     c = rb_define_class_under(m, "Error", rb_eStandardError);
     snapshot_error = rb_define_class_under(m, "SnapshotError", c);
     platform_init_error = rb_define_class_under(m, "PlatformAlreadyInitialized", c);

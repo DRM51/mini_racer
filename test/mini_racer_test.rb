@@ -803,6 +803,27 @@ class MiniRacerTest < Minitest::Test
     context&.dispose
   end
 
+  def test_date_iso_option_writes_far_years_so_javascript_can_parse_them
+    context = MiniRacer::Context.new(date: :iso)
+    context.eval(<<~JS)
+      function echo(value) { return value; }
+      function parsed(value) { return new Date(value).toISOString().split("T")[0]; }
+    JS
+    {
+      Date.new(-50, 1, 1) => "-000050-01-01",
+      Date.new(12_345, 6, 7) => "+012345-06-07",
+      Date.new(10_000, 1, 1) => "+010000-01-01"
+    }.each do |date, text|
+      assert_equal text, context.call("echo", date)
+      assert_equal text, context.call("parsed", date)
+    end
+    # years 0 to 9999 are unchanged
+    assert_equal "0000-01-01", context.call("echo", Date.new(0, 1, 1))
+    assert_equal "9999-12-31", context.call("parsed", Date.new(9999, 12, 31))
+  ensure
+    context&.dispose
+  end
+
   def test_date_option_defaults_to_js_dates
     [
       MiniRacer::Context.new,
@@ -839,9 +860,47 @@ class MiniRacerTest < Minitest::Test
     default&.dispose
   end
 
+  def test_decimal_string_option_passes_big_decimals_exactly
+    require "bigdecimal"
+    context = MiniRacer::Context.new(decimal: :string)
+    context.eval("function echo(value) { return value; }")
+
+    {
+      "12345678901234567890.123456789" => "12345678901234567890.123456789",
+      "-0.5" => "-0.5",
+      "12" => "12.0",
+      "0.000000000000000000001" => "0.000000000000000000001",
+      "NaN" => "NaN",
+      "-Infinity" => "-Infinity",
+      # past 1000 places from the point, scientific, never a huge string
+      "1e1001" => "0.1e1002",
+      "1e-1002" => "0.1e-1001"
+    }.each do |decimal, text|
+      assert_equal text, context.call("echo", BigDecimal(decimal)), decimal
+    end
+    assert_equal(
+      { "total" => ["0.3"] },
+      context.call("echo", { total: [BigDecimal("0.1") + BigDecimal("0.2")] })
+    )
+    context.attach("rubyNumeric", -> { { amount: BigDecimal("1234567.891") } })
+    assert_equal "1234567.891", context.eval("rubyNumeric().amount")
+  ensure
+    context&.dispose
+  end
+
+  def test_conversions_lists_the_accepted_options
+    assert_equal({ date: %i[time iso], decimal: %i[float string] },
+                 MiniRacer::CONVERSIONS)
+    assert MiniRacer::CONVERSIONS.frozen?
+    MiniRacer::CONVERSIONS.each do |name, values|
+      assert values.frozen?
+      values.each { |value| MiniRacer::Context.new(name => value).dispose }
+    end
+  end
+
   def test_bad_date_and_decimal_options_are_rejected
     assert_raises(ArgumentError) { MiniRacer::Context.new(date: :string) }
-    assert_raises(ArgumentError) { MiniRacer::Context.new(decimal: :string) }
+    assert_raises(ArgumentError) { MiniRacer::Context.new(decimal: :exact) }
   end
 
   def test_datetime_missing
