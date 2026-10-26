@@ -234,6 +234,8 @@ Open `chrome://inspect` in Chrome; contexts appear under *Remote Target* (add
   `call` in progress) the console works, but calling an attached Ruby function
   raises an error, because no Ruby thread is waiting to run it.
 - `Context#debugger_attached?` tells whether a frontend is connected.
+- "Pause on uncaught exceptions" in DevTools stops on an error that is about
+  to escape to Ruby, before the `eval` or `call` raises it.
 - Not available in `:single_threaded` mode or on TruffleRuby.
 - With a forking server, start the inspector after forking, on a different
   port per worker; a child never sees its parent's contexts. With Puma:
@@ -266,6 +268,37 @@ your own machine.
 In production, prefer debugging outside the request path (a console or runner
 process replaying one job) over Puma workers, keep `max_pause:` short (say
 60–120 seconds) and always pass `wait_for_debugger` a `timeout:`.
+
+#### Supervising a debugging session
+
+For a runner that hands a context to a debugger on someone's behalf, and has
+to be able to take it back:
+
+```ruby
+ctx = MiniRacer::Context.new(inspector: "session 42", max_pause: 120_000,
+                             inspector_detach: :terminate)
+ctx.inspector_target_id      # => "be2173a6-…", the id in /json/list and the
+                             #    WebSocket URL; nil once disposed
+ctx.await_debugger(timeout: 30)
+                             # => :ready, :timeout, :cancelled or :disposed
+ctx.cancel_debugger_wait     # from another thread; Context#stop does it too
+ctx.inspector_state          # => {attached:, ready:, paused:, pause_generation:,
+                             #     paused_ms:, total_paused_ms:}
+ctx.disconnect_debugger      # drop the frontend and end what's running or paused
+```
+
+- `inspector_detach:` says what a disconnect does to a script that is running
+  or paused: `:resume` (the default) lets it carry on; `:terminate` ends it
+  with `MiniRacer::ScriptTerminatedError`. The context stays usable either way.
+- `disconnect_debugger` stops the script first (as `Context#stop` does), so
+  revoking access never lets it run on unobserved; `terminate: false` leaves
+  that to `inspector_detach:`.
+- `pause_generation` counts pauses. A call frame id a frontend got during one
+  pause means nothing after the next, so reject commands that carry an old
+  generation.
+- `max_pause:` limits each pause, not their total: enforce a session
+  deadline with `total_paused_ms` and `paused_ms`, or by disposing the
+  context.
 
 ### Locals of an uncaught exception
 

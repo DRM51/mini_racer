@@ -140,28 +140,105 @@ module MiniRacer
     # Blocks until a DevTools frontend has attached and is ready, then pauses
     # on the first statement of the next eval or call so breakpoints can be
     # set before any code runs. Returns false if |timeout| (seconds) passes
-    # first, true otherwise.
+    # first or the wait is cancelled, true otherwise. See #await_debugger.
     def wait_for_debugger(timeout: nil)
+      case await_debugger(timeout: timeout)
+      when :ready
+        true
+      when :disposed
+        raise ContextDisposedError, "disposed context"
+      else
+        false
+      end
+    end
+
+    # Like #wait_for_debugger, but says how the wait ended: :ready (the next
+    # eval or call will pause on its first statement), :timeout,
+    # :cancelled (#cancel_debugger_wait or #stop, from another thread) or
+    # :disposed.
+    def await_debugger(timeout: nil)
       if __inspector_status & INSPECTOR_ENABLED == 0
         raise ArgumentError, "context was not created with inspector:"
       end
+      @debugger_wait_cancelled = false
       deadline =
         timeout && Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      until __inspector_status & INSPECTOR_READY != 0
+      loop do
+        status =
+          begin
+            __inspector_status
+          rescue ContextDisposedError
+            return :disposed
+          end
+        if status & INSPECTOR_READY != 0
+          __inspector_break_next
+          return :ready
+        end
+        return :cancelled if @debugger_wait_cancelled
         if deadline &&
              Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
-          return false
+          return :timeout
         end
-        sleep 0.05
+        sleep 0.02
       end
-      __inspector_break_next
-      true
+    end
+
+    # Ends a #wait_for_debugger or #await_debugger in progress on another
+    # thread; it returns :cancelled within about 20 ms.
+    def cancel_debugger_wait
+      @debugger_wait_cancelled = true
+      nil
+    end
+
+    # Context#stop also ends a wait for the debugger.
+    alias_method :__stop_execution, :stop
+    private :__stop_execution
+    def stop
+      @debugger_wait_cancelled = true
+      __stop_execution
+    end
+
+    # The inspector's view of this context, for a supervisor deciding when
+    # to end a debugging session; nil without inspector:.
+    #
+    #   attached:         a frontend is connected
+    #   ready:            it sent Runtime.runIfWaitingForDebugger
+    #   paused:           stopped at a breakpoint or a debugger statement
+    #   pause_generation: pauses so far; anything a frontend got during a
+    #                     pause (a call frame id) is stale once it changes
+    #   paused_ms:        how long the current pause has lasted
+    #   total_paused_ms:  all pauses so far, the current one excluded
+    def inspector_state
+      bits, generation, total_ms, current_ms = __inspector_state || return
+      {
+        attached: bits & INSPECTOR_ATTACHED != 0,
+        ready: bits & INSPECTOR_READY != 0,
+        paused: bits & INSPECTOR_PAUSED != 0,
+        pause_generation: generation,
+        paused_ms: current_ms,
+        total_paused_ms: total_ms
+      }
+    end
+
+    # Drops the attached DevTools frontend, if any, for revoking access.
+    # With terminate: true (the default) whatever is running or paused is
+    # ended first (as by #stop, raising ScriptTerminatedError in the eval or
+    # call), so revoking never lets the script run on unobserved. With
+    # terminate: false, Context.new's inspector_detach: decides, as for any
+    # disconnect (:resume, the default, lets it continue).
+    def disconnect_debugger(terminate: true)
+      stop if terminate
+      __inspector_disconnect
     end
 
     INSPECTOR_ENABLED = 1
     INSPECTOR_ATTACHED = 2
     INSPECTOR_READY = 4
-    private_constant :INSPECTOR_ENABLED, :INSPECTOR_ATTACHED, :INSPECTOR_READY
+    INSPECTOR_PAUSED = 8
+    private_constant :INSPECTOR_ENABLED,
+                     :INSPECTOR_ATTACHED,
+                     :INSPECTOR_READY,
+                     :INSPECTOR_PAUSED
   end
 
   # Chrome DevTools Protocol server, one per process. Contexts created with

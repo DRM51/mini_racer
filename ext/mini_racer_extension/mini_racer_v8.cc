@@ -879,6 +879,11 @@ bool inspector_drain(Inspector& in)
             in.pause_on_exceptions = false;
             if (!in.session)
                 break;
+            // inspector_detach: :terminate ends what the debugger was
+            // watching instead of letting it run on unobserved
+            if (v8_inspector_detach_terminates(in.st.ruby_context) &&
+                (in.paused || in.st.javascript_call_depth > 0))
+                request_termination(&in.st, NON_WATCHDOG_TERMINATION);
             in.disconnect_pending = true;
             if (in.paused) {
                 in.session->resume();
@@ -974,6 +979,7 @@ void inspector_init(State& st, const char *title)
     in.title = title;
     inspector_create(in);
     in.target = mri::register_target(title, inspector_wake, &st);
+    v8_inspector_registered(st.ruby_context, mri::target_id(*in.target).c_str());
 }
 
 void inspector_teardown(State& st)
@@ -3068,6 +3074,11 @@ extern "C" int v8_inspector_status(State *pst)
     return INSPECTOR_ENABLED
         | (in->attached.load() ? INSPECTOR_ATTACHED : 0)
         | (in->ready.load() ? INSPECTOR_READY : 0);
+}
+
+extern "C" int v8_inspector_disconnect(const char *target_id)
+{
+    return mri::disconnect(target_id) ? 1 : 0;
 }
 
 extern "C" void v8_inspector_break_next(State *pst)
