@@ -1057,6 +1057,12 @@ Event poll(Target& t, std::string *msg, bool hold_connect)
     return std::get<0>(ev);
 }
 
+bool pending(Target& t)
+{
+    std::lock_guard<std::mutex> lock(t.mu);
+    return !t.q.empty();
+}
+
 void wait(Target& t, int ms)
 {
     std::unique_lock<std::mutex> lock(t.mu);
