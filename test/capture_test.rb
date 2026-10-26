@@ -510,6 +510,51 @@ class MiniRacerCaptureTest < Minitest::Test
     assert_equal 2, ctx.eval("1 + 1")
   end
 
+  def test_expressions_report_runtime_errors_where_they_happen
+    ctx = new_context_with(expressions: %w[row.id compute() big huge])
+    ctx.eval(<<~JS)
+      function inner(row) {
+        Object.defineProperty(row, "id", { get() { throw new ReferenceError("from a getter") } });
+        const compute = () => { throw new ReferenceError("runtime") };
+        const big = 7n, huge = 2n ** 5000n;
+        throw new Error("x");
+      }
+      function outer() { const row = { id: 99 }; const compute = () => 88; return inner({}) }
+    JS
+    results = capture_of { ctx.call("outer") }["expressions"]
+    # a ReferenceError the code threw is the answer, not a reason to try the
+    # outer frame's row and compute
+    assert_equal(
+      {
+        "expression" => "row.id",
+        "frame" => 0,
+        "error" => "ReferenceError: from a getter"
+      },
+      results[0]
+    )
+    assert_equal(
+      {
+        "expression" => "compute()",
+        "frame" => 0,
+        "error" => "ReferenceError: runtime"
+      },
+      results[1]
+    )
+    assert_equal 7, results[2]["value"] # a BigInt, as a local would be
+    assert_match(/\A\[BigInt: \d+ digits\]\z/, results[3]["value"])
+  end
+
+  def test_expressions_must_be_valid_text
+    ["\xff".b, "\xff".dup.force_encoding("UTF-8")].each do |bad|
+      assert_raises(ArgumentError, bad.inspect) do
+        MiniRacer::Context.new(capture_on_throw: { expressions: [bad] })
+      end
+    end
+    ctx = new_context_with(expressions: ["\"\u00e9\"".encode("ISO-8859-1")])
+    capture = capture_of { ctx.eval("(function f() { null.x })()") }
+    assert_equal "\u00e9", capture["expressions"].first["value"]
+  end
+
   def test_expression_options_are_checked
     [
       { expressions: "row.id" },

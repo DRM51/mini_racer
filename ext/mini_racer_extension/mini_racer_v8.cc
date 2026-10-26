@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 #include <cassert>
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdint>
@@ -1408,6 +1409,43 @@ bool thrown_value(Capture& cap, CaptureWalk& walk, v8::Local<v8::Value> data,
     return true;
 }
 
+// A BigInt from its decimal digits, through the safe context's BigInt(),
+// which user code can't have replaced. Huge ones become a size note.
+v8::Local<v8::Value> big_int_from_digits(State& st, const std::string& digits)
+{
+    if (digits.size() > 400)
+        return v8::String::NewFromUtf8(st.isolate, ("[BigInt: " + std::to_string(digits.size()) +
+                                                   " digits]").c_str()).ToLocalChecked();
+    v8::Local<v8::Value> ctor, v;
+    v8::Local<v8::Value> arg = v8::String::NewFromUtf8(st.isolate, digits.c_str()).ToLocalChecked();
+    auto key = v8::String::NewFromUtf8Literal(st.isolate, "BigInt");
+    if (st.safe_context->Global()->Get(st.safe_context, key).ToLocal(&ctor) && ctor->IsFunction() &&
+        ctor.As<v8::Function>()->Call(st.safe_context, v8::Undefined(st.isolate), 1, &arg).ToLocal(&v))
+        return v;
+    return arg;
+}
+
+// "ReferenceError: row is not defined" for a name the expression itself uses:
+// the frame doesn't have it, an outer one may. Not a ReferenceError that
+// code the expression called threw, or one about some other name.
+bool names_undefined_identifier(const std::string& error, const std::string& expression)
+{
+    static const std::string prefix = "ReferenceError: ", suffix = " is not defined";
+    if (error.size() <= prefix.size() + suffix.size() ||
+        error.compare(0, prefix.size(), prefix) ||
+        error.compare(error.size() - suffix.size(), suffix.size(), suffix))
+        return false;
+    std::string name = error.substr(prefix.size(), error.size() - prefix.size() - suffix.size());
+    auto ident = [](unsigned char c) { return std::isalnum(c) || c == '_' || c == '$' || c >= 0x80; };
+    for (size_t at = expression.find(name); at != std::string::npos; at = expression.find(name, at + 1)) {
+        size_t end = at + name.size();
+        bool alone = (at == 0 || (!ident(expression[at - 1]) && expression[at - 1] != '.')) &&
+                     (end == expression.size() || !ident(expression[end]));
+        if (alone) return true;
+    }
+    return false;
+}
+
 // Evaluates one capture_on_throw expression in a paused frame, without side
 // effects: V8 refuses anything that would assign, call a non-pure function
 // (an attached Ruby function among them) or run a getter, and stops it after
@@ -1423,8 +1461,8 @@ bool capture_evaluate(Capture& cap, CaptureWalk& walk, v8::Local<v8::Value> fram
     auto params = walk.new_object();
     walk.put(params, walk.str("callFrameId"), get_field(sc, frame, "callFrameId"));
     walk.put(params, walk.str("expression"), walk.str(expression));
-    // released when the pause ends, like the scope objects
-    walk.put(params, walk.str("objectGroup"), walk.str("backtrace"));
+    // released by capture_expressions once recorded
+    walk.put(params, walk.str("objectGroup"), walk.str("capture"));
     walk.put(params, walk.str("silent"), v8::True(st.isolate));
     walk.put(params, walk.str("throwOnSideEffect"), v8::True(st.isolate));
     walk.put(params, walk.str("timeout"), v8::Number::New(st.isolate, kCaptureEvalMillis));
@@ -1455,11 +1493,11 @@ bool capture_evaluate(Capture& cap, CaptureWalk& walk, v8::Local<v8::Value> fram
     auto details = get_field(sc, result, "exceptionDetails");
     if (details->IsObject()) {
         auto exception = get_field(sc, details, "exception");
-        *missing = walk.utf8(get_field(sc, exception, "className")) == "ReferenceError";
         auto text = get_field(sc, exception, "description");
         if (!text->IsString()) text = get_field(sc, details, "text");
         std::string line = walk.utf8(text);
         line = line.substr(0, line.find('\n')); // the message, not the stack
+        *missing = names_undefined_identifier(line, expression);
         *error = walk.utf8(walk.truncated(walk.str(line)));
         return false;
     }
@@ -1469,7 +1507,9 @@ bool capture_evaluate(Capture& cap, CaptureWalk& walk, v8::Local<v8::Value> fram
         *error = "[not representable]";
         return false;
     }
-    *value = bigint.empty() ? walk.value(v, 0) : walk.str(bigint).As<v8::Value>();
+    if (!bigint.empty()) // CDP sends "12n"; make it a BigInt again, as locals are
+        v = big_int_from_digits(st, bigint.substr(0, bigint.size() - 1));
+    *value = walk.value(v, 0);
     return true;
 }
 
@@ -1508,6 +1548,8 @@ v8::Local<v8::Value> capture_expressions(Capture& cap, CaptureWalk& walk, v8::Lo
         if (!done) walk.put(entry, walk.str("error"), walk.str(error));
         walk.put(out, k++, entry);
     }
+    // the results are copies now; let V8 collect the originals
+    capture_dispatch(cap, "{\"id\":5,\"method\":\"Runtime.releaseObjectGroup\",\"params\":{\"objectGroup\":\"capture\"}}");
     return out;
 }
 
