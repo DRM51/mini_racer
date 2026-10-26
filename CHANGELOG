@@ -1,3 +1,12 @@
+- 0.22.2.10 - 26-10-2026
+  - DRM51 build: 0.22.2.9 plus the changes below
+  - A reply that can't be returned to Ruby (too large, out of memory) becomes an internal error instead of ending the process; `Platform.set_flags!` raises `NoMemoryError` instead of dropping a flag; an oversized callback error message is replaced instead of sent empty
+  - `max_memory:` now also refuses resizable ArrayBuffers and growable SharedArrayBuffers (their memory can't be counted) with a `RangeError`, and ends a script whose heap grows past the limit together with the buffers it holds
+  - `Thread#kill` while a result is converted to Ruby kills the thread instead of raising `TypeError` (upstream #404); a `throw` from a Ruby callback to a `catch` outside the JavaScript call raises a `RuntimeError` instead of crashing
+  - capture_on_throw: an object's keys are listed once, integer keys past the first 50 get the "… N more" marker, non-enumerable integer keys stay hidden; deep throws are parsed faster
+  - Inspector: DevTools' "Pause on uncaught exceptions" stops on errors that escape to Ruby
+  - Inspector, for supervising debugging sessions: `Context#inspector_target_id`, `#inspector_state`, `#await_debugger` (`:ready`, `:timeout`, `:cancelled`, `:disposed`), `#cancel_debugger_wait`, `#disconnect_debugger`, `Context.new(inspector_detach: :resume | :terminate)`; `Inspector.start` takes the transport limits and `max_targets:` and refuses different settings once started; `Inspector.stop`, `Inspector.endpoint`, `Inspector.events`
+
 - 0.22.2.9 - 26-10-2026
   - DRM51 build: 0.22.2.7 plus the changes below
   - Values passed between Ruby and JavaScript are limited to 1 GiB serialized; larger ones raise `MiniRacer::RuntimeError` ("serialized value too large (over 1 GiB)", or "RangeError: value too large to return to Ruby" from JavaScript)
