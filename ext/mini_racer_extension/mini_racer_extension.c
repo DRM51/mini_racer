@@ -1646,6 +1646,11 @@ static VALUE rendezvous1(Context *c, Buf *req, DesCtx *d)
     buf_reset(&res);
     if (exc) {
         r = rb_errinfo();
+        // Thread#kill (and throw/catch) unwind through here with something
+        // that isn't an exception in errinfo; continue the jump instead of
+        // turning it into "TypeError: exception class/object expected"
+        if (!rb_obj_is_kind_of(r, rb_eException))
+            rb_jump_tag(exc);
         rb_set_errinfo(Qnil);
         rb_exc_raise(r);
     }
