@@ -2819,6 +2819,24 @@ class MiniRacerTest < Minitest::Test
     assert_raises(ArgumentError) { MiniRacer::Context.new(max_value_size: (1 << 30) + 1) }
   end
 
+  # upstream PR #423: a nested timed call must not disarm the outer timeout,
+  # and the outer deadline passing during a nested call still ends it
+  def test_nested_calls_keep_the_outer_timeout
+    [
+      ["1 + 1", "nested(); while (true) {}"],
+      ["while (true) {}", "nested(); while (true) {}"],
+      ["const t = Date.now(); while (Date.now() - t < 300) {}", "nested(); while (true) {}"]
+    ].each do |nested_js, outer_js|
+      context = MiniRacer::Context.new(timeout: 100)
+      context.attach("nested", proc { context.eval(nested_js) rescue nil })
+      safety = Thread.new { sleep 5; context.stop } # a regression fails, not hangs
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      assert_raises(MiniRacer::ScriptTerminatedError) { context.eval(outer_js) }
+      assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 3, nested_js
+      safety.kill
+    end
+  end
+
   def test_max_memory_bounds_array_buffers
     context = MiniRacer::Context.new(max_memory: 64 << 20)
     # one buffer over the limit, and many that together are
