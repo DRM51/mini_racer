@@ -880,7 +880,10 @@ class MiniRacerTest < Minitest::Test
       "1e-1000" => "0.#{"0" * 999}1",
       "1e-1001" => "0.1e-1000",
       "0.#{"1" * 1000}" => "0.#{"1" * 1000}",
-      "0.#{"1" * 1001}" => "0.#{"1" * 1001}e0"
+      "0.#{"1" * 1001}" => "0.#{"1" * 1001}e0",
+      # the smallest exponents
+      "1.1e-9223372036854775807" => "0.11e-9223372036854775806",
+      "-1.1e-9223372036854775808" => "-0.11e-9223372036854775807"
     }.each do |decimal, text|
       assert_equal text, context.call("echo", BigDecimal(decimal)), decimal
     end
