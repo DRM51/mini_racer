@@ -871,19 +871,23 @@ bool inspector_drain(Inspector& in)
                     v8_inspector::V8Inspector::kFullyTrusted);
             }
             in.attached = true;
+            v8_inspector_event(in.st.ruby_context, INSPECTOR_EVENT_ATTACHED, nullptr);
             break;
         case mri::Event::Disconnect:
             in.attached = false;
             in.ready = false;
             in.break_next = false;
             in.pause_on_exceptions = false;
+            v8_inspector_event(in.st.ruby_context, INSPECTOR_EVENT_DETACHED, nullptr);
             if (!in.session)
                 break;
             // inspector_detach: :terminate ends what the debugger was
             // watching instead of letting it run on unobserved
             if (v8_inspector_detach_terminates(in.st.ruby_context) &&
-                (in.paused || in.st.javascript_call_depth > 0))
+                (in.paused || in.st.javascript_call_depth > 0)) {
+                v8_inspector_event(in.st.ruby_context, INSPECTOR_EVENT_TERMINATED, "detach");
                 request_termination(&in.st, NON_WATCHDOG_TERMINATION);
+            }
             in.disconnect_pending = true;
             if (in.paused) {
                 in.session->resume();
@@ -927,6 +931,7 @@ void InspectorClient::runMessageLoopOnPause(int)
         // a forgotten breakpoint must not hold the calling thread forever
         if (max_pause > 0 && std::chrono::steady_clock::now() - start >=
                                  std::chrono::milliseconds(max_pause)) {
+            v8_inspector_event(st.ruby_context, INSPECTOR_EVENT_TERMINATED, "max_pause");
             request_termination(&st, NON_WATCHDOG_TERMINATION);
             break;
         }
@@ -974,11 +979,16 @@ void inspector_wake(void *arg)
 
 void inspector_init(State& st, const char *title)
 {
+    // registered first: past Inspector.start's max_targets: there's no
+    // target, no Inspector is made, and Context.new raises
+    auto target = mri::register_target(title, inspector_wake, &st);
+    if (!target)
+        return;
     st.inspector = std::make_unique<Inspector>(st);
     Inspector& in = *st.inspector;
     in.title = title;
     inspector_create(in);
-    in.target = mri::register_target(title, inspector_wake, &st);
+    in.target = std::move(target);
     v8_inspector_registered(st.ruby_context, mri::target_id(*in.target).c_str());
 }
 
@@ -987,6 +997,7 @@ void inspector_teardown(State& st)
     Inspector& in = *st.inspector;
     if (!in.target)
         return;
+    v8_inspector_event(st.ruby_context, INSPECTOR_EVENT_DESTROYED, nullptr);
     mri::unregister_target(in.target); // no wakes after this returns
     in.attached = false;
     in.ready = false;
@@ -3088,13 +3099,32 @@ extern "C" void v8_inspector_break_next(State *pst)
 }
 
 extern "C" int v8_inspector_start(const char *host, int port, const char *token,
-                                  char *err, size_t errlen)
+                                  const int64_t settings[8], char *err, size_t errlen)
 {
+    mri::Settings s;
+    s.max_message = static_cast<uint64_t>(settings[0]);
+    s.max_connections = static_cast<size_t>(settings[1]);
+    s.send_idle_ms = static_cast<int>(settings[2]);
+    s.send_total_ms = static_cast<int>(settings[3]);
+    s.handshake_ms = static_cast<int>(settings[4]);
+    s.max_queued = static_cast<size_t>(settings[5]);
+    s.max_queued_bytes = static_cast<size_t>(settings[6]);
+    s.max_targets = static_cast<size_t>(settings[7]);
     std::string e;
-    int r = mri::start_server(host, port, token, &e);
+    int r = mri::start_server(host, port, token, s, &e);
     if (r < 0)
         snprintf(err, errlen, "%s", e.c_str());
     return r;
+}
+
+extern "C" int v8_inspector_stop(void)
+{
+    return mri::stop_server() ? 1 : 0;
+}
+
+extern "C" long v8_inspector_target_count(void)
+{
+    return static_cast<long>(mri::target_count());
 }
 
 extern "C" int v8_inspector_port(void)

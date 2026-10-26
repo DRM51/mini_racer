@@ -249,9 +249,36 @@ module MiniRacer
   module Inspector
     DEFAULT_PORT = 9229
 
+    # Limits the server applies, with their defaults. Times are seconds.
+    #
+    #   max_connections:   open sockets at once (32)
+    #   max_message_bytes: largest WebSocket message from a frontend (16 MiB)
+    #   max_queued_messages / max_queued_bytes: messages waiting for a busy
+    #                      context before its frontend is dropped (4096, 64 MiB)
+    #   handshake_timeout: to finish the HTTP request or WebSocket handshake (10)
+    #   send_idle_timeout / send_timeout: a frontend that stops reading is
+    #                      dropped after this long without progress on one
+    #                      message, or this long for it in all (10, 30)
+    #   max_targets:       inspectable contexts in the process; Context.new
+    #                      raises past it (nil: no cap). Counts contexts made
+    #                      before the server started too.
+    DEFAULT_SETTINGS = {
+      max_connections: 32,
+      max_message_bytes: 16 << 20,
+      max_queued_messages: 4096,
+      max_queued_bytes: 64 << 20,
+      handshake_timeout: 10,
+      send_idle_timeout: 10,
+      send_timeout: 30,
+      max_targets: nil
+    }.freeze
+
     # Starts the server and returns the bound port (pass port: 0 for any
-    # free port). Calling it again in the same process returns that port;
-    # a forked child starts afresh, without the parent's contexts.
+    # free port). Calling it again in the same process returns that port,
+    # as long as the call asks for the same thing; a different host, token,
+    # explicit port or setting raises ArgumentError rather than being
+    # silently ignored (Inspector.stop first to change them). A forked child
+    # starts afresh, without the parent's contexts.
     #
     # Binding anything but a loopback address exposes code execution to the
     # network and needs allow_remote: true.
@@ -261,11 +288,14 @@ module MiniRacer
     # someone told the URL can find or attach to a context. chrome://inspect
     # can't discover such targets; open the devtoolsFrontendUrl from
     # Inspector.url instead.
+    #
+    # Other keywords: see DEFAULT_SETTINGS.
     def self.start(
       host: "127.0.0.1",
       port: DEFAULT_PORT,
       allow_remote: false,
-      token: nil
+      token: nil,
+      **settings
     )
       host = host.to_s
       if !allow_remote && !loopback?(host)
@@ -274,20 +304,128 @@ module MiniRacer
                 "connect can run code in your contexts; bind 127.0.0.1 and " \
                 "tunnel, or pass allow_remote: true"
       end
+      unless token == true || token.to_s.match?(/\A[A-Za-z0-9_-]*\z/)
+        raise ArgumentError, "token may only contain letters, digits, - and _"
+      end
+      settings = settings_for(settings)
+      port = Integer(port)
+      if started?
+        check_same!(host, port, token, settings)
+        return self.port
+      end
       if token == true
         require "securerandom"
         token = SecureRandom.hex(16)
       end
       token = token.to_s
-      unless token.match?(/\A[A-Za-z0-9_-]*\z/)
-        raise ArgumentError, "token may only contain letters, digits, - and _"
-      end
-      return self.port if started? # the method, not the port: keyword
-      bound = __start(host, Integer(port), token)
+      bound = __start(host, port, token, native_settings(settings))
+      require "securerandom"
       @host = host
       @token = token.empty? ? nil : token
+      @settings = settings
+      @boot_id = SecureRandom.uuid
+      @pid = Process.pid
       bound
     end
+
+    # Stops listening, drops every attached frontend (each context then
+    # behaves as on any disconnect: see Context.new's inspector_detach:) and
+    # waits for the server thread. Contexts stay inspectable and reappear
+    # if the server starts again. Returns whether it was running.
+    def self.stop
+      stopped = __stop
+      @host = @token = @settings = @boot_id = @pid = nil
+      stopped
+    end
+
+    # Where the server is, for a supervisor to route debugging sessions
+    # without parsing URLs: {host:, port:, pid:, boot_id:}, or nil when not
+    # started. boot_id is new on every start, so a recycled pid or port
+    # can't be mistaken for an older server. It leaves the token out: hand
+    # that out separately, if at all.
+    def self.endpoint
+      p = port or return nil
+      return nil unless @pid == Process.pid
+      { host: @host, port: p, pid: @pid, boot_id: @boot_id }
+    end
+
+    # What happened to inspectable contexts, oldest first, for auditing a
+    # debugging session or reacting to one (a supervisor ending a session
+    # whose frontend detached, say). Waits up to |timeout| seconds for the
+    # first event (nil: until there is one; 0: don't wait) and returns at
+    # most |max| (up to 64). Each is a Hash:
+    #
+    #   seq:              increasing; a gap means events were dropped
+    #   event:            :created, :destroyed, :attached, :detached,
+    #                     :paused, :resumed or :terminated
+    #   target_id:        Context#inspector_target_id
+    #   pause_generation: the context's, when it happened
+    #   at:               Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    #                     seconds, when it happened
+    #   reason:           for :terminated, :max_pause or :detach
+    #                     (inspector_detach: :terminate); else nil
+    #
+    # The process keeps the last 1024 unread events; older ones are dropped
+    # and counted in events_dropped. Events are consumed by whoever reads
+    # them: have one reader.
+    def self.events(timeout: 0, max: 64)
+      timeout_ms = timeout.nil? ? -1 : (Float(timeout) * 1000).ceil
+      raise ArgumentError, "bad timeout" if timeout_ms < -1
+      __events(timeout_ms, Integer(max)).map do |seq, event, at_ms, generation, target, reason|
+        {
+          seq: seq,
+          event: event.to_sym,
+          target_id: target,
+          pause_generation: generation,
+          at: at_ms / 1000.0,
+          reason: reason.empty? ? nil : reason.to_sym
+        }
+      end
+    end
+
+    def self.settings_for(given)
+      unknown = given.keys - DEFAULT_SETTINGS.keys
+      unless unknown.empty?
+        raise ArgumentError, "unknown inspector setting: #{unknown.join(", ")}"
+      end
+      settings = DEFAULT_SETTINGS.merge(given)
+      settings.each do |k, v|
+        next if k == :max_targets && v.nil?
+        unless v.is_a?(Numeric) && v.positive? && v <= (k.end_with?("timeout") ? 86_400 : 1 << 40)
+          raise ArgumentError, "bad inspector setting #{k}: #{v.inspect}"
+        end
+      end
+      settings.freeze
+    end
+    private_class_method :settings_for
+
+    def self.native_settings(s)
+      ms = ->(seconds) { (seconds * 1000).ceil }
+      [
+        Integer(s[:max_message_bytes]),
+        Integer(s[:max_connections]),
+        ms.(s[:send_idle_timeout]),
+        ms.(s[:send_timeout]),
+        ms.(s[:handshake_timeout]),
+        Integer(s[:max_queued_messages]),
+        Integer(s[:max_queued_bytes]),
+        s[:max_targets] ? Integer(s[:max_targets]) : 0
+      ]
+    end
+    private_class_method :native_settings
+
+    def self.check_same!(host, port, token, settings)
+      differs = []
+      differs << "host" if host != @host
+      differs << "port" if port != 0 && port != self.port
+      differs << "token" if token == true ? @token.nil? : token.to_s != @token.to_s
+      differs << "settings" if settings != @settings
+      return if differs.empty?
+      raise ArgumentError,
+            "inspector already started with a different #{differs.join(", ")}; " \
+              "Inspector.stop first to change it"
+    end
+    private_class_method :check_same!
 
     def self.loopback?(host)
       return true if host == "localhost"

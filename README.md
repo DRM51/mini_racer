@@ -300,6 +300,38 @@ ctx.disconnect_debugger      # drop the frontend and end what's running or pause
   deadline with `total_paused_ms` and `paused_ms`, or by disposing the
   context.
 
+Process-wide, for the same supervisor:
+
+```ruby
+MiniRacer::Inspector.start(port: 0, max_targets: 4, max_connections: 8,
+                           handshake_timeout: 5)   # see Inspector::DEFAULT_SETTINGS
+MiniRacer::Inspector.endpoint  # => {host:, port:, pid:, boot_id:}; no token
+MiniRacer::Inspector.events(timeout: 1)
+  # => [{seq: 7, event: :paused, target_id: "be21…", pause_generation: 1,
+  #      at: 1707733.4, reason: nil}, …]
+MiniRacer::Inspector.stop      # drop every frontend, stop listening
+```
+
+- `Inspector.start` called again with a different host, token, explicit port
+  or setting raises `ArgumentError` instead of quietly returning the running
+  server's port (`Inspector.stop` first to change them).
+- `max_targets:` caps inspectable contexts in the process: `Context.new`
+  raises `MiniRacer::RuntimeError` past it. The other settings are the
+  transport limits (connections, message and queue sizes, handshake and send
+  timeouts), which had fixed values before.
+- `boot_id` is new on every start, so a supervisor can tell a restarted
+  server, or a recycled pid or port, from the one it registered.
+- `Inspector.events` reports `:created`, `:destroyed`, `:attached`,
+  `:detached`, `:paused`, `:resumed` and `:terminated` (with `reason:
+  :max_pause` or `:detach`), oldest first, waiting up to `timeout:` seconds
+  for the first. The last 1024 unread are kept; older ones are dropped and
+  counted in `Inspector.events_dropped`, and a gap in `seq` shows where.
+  Reading consumes them, so have one reader. They record what happened; they
+  are not a way to stop anything (use `Context#stop` or `#disconnect_debugger`).
+- `Inspector.stop` disconnects frontends as if they had gone away
+  (`inspector_detach:` applies) and waits for the server thread. Contexts stay
+  inspectable and are listed again when the server restarts.
+
 ### Locals of an uncaught exception
 
 `capture_on_throw: true` records where an uncaught exception was thrown and

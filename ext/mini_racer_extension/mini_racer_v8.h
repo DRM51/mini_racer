@@ -38,6 +38,18 @@ int64_t v8_inspector_max_pause(struct Context *c); // ms, 0 = unlimited
 void v8_inspector_registered(struct Context *c, const char *target_id); // v8 thread, during init
 int v8_inspector_detach_terminates(struct Context *c); // Context.new(inspector_detach: :terminate)
 
+enum InspectorEventType {
+    INSPECTOR_EVENT_CREATED,
+    INSPECTOR_EVENT_DESTROYED,
+    INSPECTOR_EVENT_ATTACHED,
+    INSPECTOR_EVENT_DETACHED,
+    INSPECTOR_EVENT_PAUSED,
+    INSPECTOR_EVENT_RESUMED,
+    INSPECTOR_EVENT_TERMINATED,
+};
+// any thread; |reason| may be NULL
+void v8_inspector_event(struct Context *c, int type, const char *reason);
+
 // defined in mini_racer_v8.cc
 void v8_global_init(void);
 struct State *v8_thread_init(struct Context *c, const uint8_t *snapshot_buf,
@@ -82,7 +94,12 @@ void v8_inspector_shutdown(struct State *pst); // v8 thread, without Context.mtx
 int v8_inspector_status(struct State *pst);
 void v8_inspector_break_next(struct State *pst);
 int v8_inspector_disconnect(const char *target_id); // any thread; 0 if no such target
-int v8_inspector_start(const char *host, int port, const char *token, char *err, size_t errlen);
+// |settings|: max_message, max_connections, send_idle_ms, send_total_ms,
+// handshake_ms, max_queued, max_queued_bytes, max_targets
+int v8_inspector_start(const char *host, int port, const char *token,
+                       const int64_t settings[8], char *err, size_t errlen);
+int v8_inspector_stop(void); // 1 if it was running
+long v8_inspector_target_count(void);
 int v8_inspector_port(void);
 
 #ifdef __cplusplus
