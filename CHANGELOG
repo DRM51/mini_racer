@@ -1,3 +1,7 @@
+- 0.22.2.12 - 26-10-2026
+  - DRM51 build: 0.22.2.11 plus the change below
+  - Each value passed between Ruby and JavaScript is limited to the context's `max_memory` (1 GiB without one, and never more), or to `Context.new(max_value_size: bytes)`; the error names the limit in force, e.g. "serialized value too large (over 512 MB)"
+
 - 0.22.2.11 - 26-10-2026
   - DRM51 build: 0.22.2.10 plus the changes below
   - The `max_memory:` guard against resizable buffers reads `maxByteLength` once and passes V8 only the length, so an options object can no longer answer differently the second time
