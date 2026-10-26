@@ -148,6 +148,27 @@ context.eval("var a = new Array(10000); while(true) {a = a.concat(new Array(1000
 # => V8OutOfMemoryError is raised
 ```
 
+`max_memory:` also bounds the memory behind ArrayBuffers and typed arrays
+(V8 keeps it outside its heap): an allocation that would take the heap size
+at the last garbage collection plus all live buffers past the limit fails
+with a `RangeError` ("Array buffer allocation failed") that the script can
+catch, after V8 has collected garbage and retried.
+
+It doesn't cover:
+
+- WebAssembly memories. `new WebAssembly.Memory({initial: 16384})` takes
+  1 GiB whatever the limit. For untrusted scripts, remove the API with
+  `context.eval("delete globalThis.WebAssembly")`, or cap each memory
+  process-wide with `MiniRacer::Platform.set_flags!("--wasm-max-mem-pages=N")`
+  (64 KiB pages).
+- The copy of a value passed between Ruby and JavaScript. Each is limited to
+  1 GiB serialized (V8's buffer for one can reach 2 GiB before it's refused);
+  larger values raise `MiniRacer::RuntimeError`.
+- Ruby objects made from JavaScript results.
+
+To bound everything, run untrusted scripts in a separate process with an OS
+memory limit.
+
 ### Rich Debugging with File Name in Stack Trace Support
 
 You can provide `filename:` to `#eval` which will be used in stack traces produced by V8:

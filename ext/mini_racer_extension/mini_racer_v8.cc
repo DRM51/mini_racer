@@ -117,6 +117,9 @@ struct State
     v8::Persistent<v8::Value> ruby_exception;
     Context *ruby_context;
     int64_t max_memory;
+    // used_heap_size at the last GC; max_memory bounds it plus the bytes
+    // the ArrayBuffer allocator holds (BudgetAllocator)
+    std::atomic<int64_t> heap_used_at_gc;
     int err_reason;
     // TerminateExecution() while idle doesn't make IsExecutionTerminating() true
     std::atomic<unsigned> terminate_requested;
@@ -557,17 +560,74 @@ extern "C" void v8_global_init(void)
     v8::V8::Initialize();
 }
 
+void out_of_memory(State& st)
+{
+    st.err_reason = MEMORY_ERROR;
+    st.terminate_requested.fetch_or(NON_WATCHDOG_TERMINATION);
+    st.isolate->TerminateExecution();
+}
+
+// Counts ArrayBuffer backing stores (ArrayBuffers, typed arrays, Uint8Arrays
+// from Ruby) against max_memory. V8 keeps them outside its heap, so
+// used_heap_size never saw them and a script could allocate any amount.
+// Free can run on V8's background threads, hence the atomics.
+struct BudgetAllocator : v8::ArrayBuffer::Allocator
+{
+    State& st;
+    std::unique_ptr<v8::ArrayBuffer::Allocator> inner{NewDefaultAllocator()};
+    std::atomic<int64_t> used{0};
+
+    explicit BudgetAllocator(State& st) : st(st) {}
+
+    // On a refusal V8 collects garbage (which frees dead buffers) and asks
+    // again; if it's still refused, the script gets a RangeError, "Array
+    // buffer allocation failed", as for any failed allocation.
+    bool reserve(size_t n)
+    {
+        int64_t size = static_cast<int64_t>(std::min<size_t>(n, INT64_MAX/4));
+        int64_t now = used.fetch_add(size) + size;
+        if (st.max_memory <= 0 || now + st.heap_used_at_gc.load() <= st.max_memory)
+            return true;
+        used.fetch_sub(size);
+        return false;
+    }
+
+    void *Allocate(size_t n) final
+    {
+        if (!reserve(n)) return nullptr; // V8 throws a RangeError
+        void *p = inner->Allocate(n);
+        if (!p) used.fetch_sub(static_cast<int64_t>(n));
+        return p;
+    }
+
+    void *AllocateUninitialized(size_t n) final
+    {
+        if (!reserve(n)) return nullptr;
+        void *p = inner->AllocateUninitialized(n);
+        if (!p) used.fetch_sub(static_cast<int64_t>(n));
+        return p;
+    }
+
+    void Free(void *p, size_t n) final
+    {
+        inner->Free(p, n);
+        used.fetch_sub(static_cast<int64_t>(n));
+    }
+
+    size_t MaxAllocationSize() const final { return inner->MaxAllocationSize(); }
+    v8::PageAllocator *GetPageAllocator() final { return inner->GetPageAllocator(); }
+};
+
 void v8_gc_callback(v8::Isolate*, v8::GCType, v8::GCCallbackFlags, void *data)
 {
     State& st = *static_cast<State*>(data);
     v8::HeapStatistics s;
     st.isolate->GetHeapStatistics(&s);
     int64_t used_heap_size = static_cast<int64_t>(s.used_heap_size());
-    if (used_heap_size > st.max_memory) {
-        st.err_reason = MEMORY_ERROR;
-        st.terminate_requested.fetch_or(NON_WATCHDOG_TERMINATION);
-        st.isolate->TerminateExecution();
-    }
+    st.heap_used_at_gc.store(used_heap_size);
+    // not counting ArrayBuffers here: dead ones are freed after the GC ends
+    if (used_heap_size > st.max_memory)
+        out_of_memory(st);
 }
 
 } // namespace anonymous
@@ -1636,7 +1696,8 @@ extern "C" State *v8_thread_init(Context *c, const uint8_t *snapshot_buf,
     State& st = *pst;
     st.verbose_exceptions = (verbose_exceptions != 0);
     st.ruby_context = c;
-    st.allocator.reset(v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+    st.max_memory = max_memory; // before the allocator can be used
+    st.allocator.reset(new BudgetAllocator(st));
     v8::StartupData blob{nullptr, 0};
     v8::Isolate::CreateParams params;
     params.array_buffer_allocator = st.allocator.get();
@@ -1646,7 +1707,6 @@ extern "C" State *v8_thread_init(Context *c, const uint8_t *snapshot_buf,
         params.snapshot_blob = &blob;
     }
     st.isolate = v8::Isolate::New(params);
-    st.max_memory = max_memory;
     if (st.max_memory > 0)
         st.isolate->AddGCEpilogueCallback(v8_gc_callback, pst);
     {
