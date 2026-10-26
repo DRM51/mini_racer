@@ -91,8 +91,9 @@ context.call("echo", BigDecimal("12.34"))      # => 12.34
   arrives as `12345678901234567000`.
 - `decimal: :string` passes a `BigDecimal` as its exact digits instead
   (`"12345678901234567890.5"`, `"-0.5"`, `"12.0"`, `"NaN"`), for scripts that
-  need every digit. Past 1000 digits either side of the point it uses the
-  scientific form (`"0.1e1002"`), so a huge exponent can't make a huge string.
+  need every digit. When that would mean more than 1000 digits before or after
+  the point it uses the scientific form (`"0.1e1002"`), so a huge exponent
+  can't make a huge string.
 - Without a `decimal:` option a `BigDecimal` becomes the string
   `"Undefined Conversion"`, like other unsupported objects.
 - `MiniRacer::CONVERSIONS` lists the values this build accepts,

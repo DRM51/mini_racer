@@ -479,7 +479,8 @@ struct InternalReply
 {
     State& st;
     bool saved;
-    explicit InternalReply(State& st) : st(st), saved(st.reply_internal) { st.reply_internal = true; }
+    explicit InternalReply(State& st, bool internal = true)
+        : st(st), saved(st.reply_internal) { st.reply_internal = internal; }
     ~InternalReply() { st.reply_internal = saved; }
 };
 
@@ -503,9 +504,13 @@ bool reply_or_fallback(State& st, v8::Local<v8::Value> result, v8::Local<v8::Val
     return reply(st, v8::Undefined(st.isolate), string_from_bytes(st.isolate, buf));
 }
 
-void reply_retry(State& st, v8::Local<v8::Value> response)
+// |internal|: the response is mini_racer's own (heap stats, a pump result),
+// exempt from max_value_size. Anything a script can shape, such as an attach
+// error from a getter on the path, is held to the limit; when over it, the
+// short internal error below goes instead.
+void reply_retry(State& st, v8::Local<v8::Value> response, bool internal)
 {
-    InternalReply internal(st);
+    InternalReply exempt(st, internal);
     v8::TryCatch try_catch(st.isolate);
     try_catch.SetVerbose(st.verbose_exceptions);
     bool ok = reply(st, response);
@@ -517,6 +522,7 @@ void reply_retry(State& st, v8::Local<v8::Value> response)
             // or out of memory): send a short internal error instead
             if (fallback) abort(); // not even that fits
             fallback = true;
+            st.reply_internal = true; // ours; |exempt| restores it
             try_catch.Reset();
             std::vector<char> buf;
             set_error_message(buf, INTERNAL_ERROR, "reply could not be returned to Ruby");
@@ -1761,9 +1767,11 @@ v8::Local<v8::Value> big_int_from_digits(State& st, const std::string& digits)
 }
 
 // "ReferenceError: row is not defined" for a name the expression itself uses:
-// the frame doesn't have it, an outer one may. Not a ReferenceError that
-// code the expression called threw, or one about some other name.
-bool names_undefined_identifier(const std::string& error, const std::string& expression)
+// the frame may not have it, an outer one may. Not a ReferenceError about
+// some other name. Sets |*name|; capture_evaluate then checks the frame
+// really lacks it, since code the expression called can throw the same text.
+bool names_undefined_identifier(const std::string& error, const std::string& expression,
+                                std::string *name_out)
 {
     static const std::string prefix = "ReferenceError: ", suffix = " is not defined";
     if (error.size() <= prefix.size() + suffix.size() ||
@@ -1776,7 +1784,10 @@ bool names_undefined_identifier(const std::string& error, const std::string& exp
         size_t end = at + name.size();
         bool alone = (at == 0 || (!ident(expression[at - 1]) && expression[at - 1] != '.')) &&
                      (end == expression.size() || !ident(expression[end]));
-        if (alone) return true;
+        if (alone) {
+            *name_out = name;
+            return true;
+        }
     }
     return false;
 }
@@ -1844,9 +1855,18 @@ bool capture_evaluate(Capture& cap, CaptureWalk& walk, v8::Local<v8::Value> fram
         // only a real ReferenceError moves on to an outer frame, not a thrown
         // look-alike whose text happens to match
         auto class_name = get_field(sc, exception, "className");
-        *missing = class_name->IsString() && walk.utf8(class_name) == "ReferenceError" &&
-                   names_undefined_identifier(line, expression);
+        std::string name;
         *error = walk.utf8(walk.truncated(walk.str(line)));
+        if (class_name->IsString() && walk.utf8(class_name) == "ReferenceError" &&
+            names_undefined_identifier(line, expression, &name)) {
+            // and only when the name isn't bound here: typeof says
+            // "undefined" for that, "function" for a fake() that threw it
+            v8::Local<v8::Value> type;
+            std::string ignored;
+            bool unused;
+            *missing = capture_evaluate(cap, walk, frame, "typeof " + name, &type, &ignored, &unused) &&
+                       type->IsString() && walk.utf8(type) == "undefined";
+        }
         return false;
     }
     v8::Local<v8::Value> v;
@@ -2270,7 +2290,7 @@ extern "C" void v8_attach(State *pst, const uint8_t *p, size_t n)
 fail:
     if (!cause && try_catch.HasCaught()) cause = RUNTIME_ERROR;
     auto err = to_error(st, &try_catch, cause);
-    reply_retry(st, err);
+    reply_retry(st, err, false);
 }
 
 struct JavascriptCallScope
@@ -2607,7 +2627,7 @@ extern "C" void v8_heap_stats(State *pst)
     PROP(number_of_native_contexts);
     PROP(number_of_detached_contexts);
 #undef PROP
-    reply_retry(st, response);
+    reply_retry(st, response, true);
 }
 
 struct OutputStream : public v8::OutputStream
@@ -2648,7 +2668,7 @@ extern "C" void v8_perform_microtask_checkpoint(State *pst)
     try_catch.SetVerbose(st.verbose_exceptions);
     v8::HandleScope handle_scope(st.isolate);
     v8::MicrotasksScope::PerformCheckpoint(st.isolate);
-    reply_retry(st, v8::Undefined(st.isolate));
+    reply_retry(st, v8::Undefined(st.isolate), true);
 }
 
 extern "C" void v8_pump_message_loop(State *pst)
@@ -2679,7 +2699,7 @@ fail:
         st.err_reason = NO_ERROR;
     }
     auto result = v8::Boolean::New(st.isolate, ran_task);
-    reply_retry(st, result);
+    reply_retry(st, result, true);
 }
 
 static uint32_t read_le32(const uint8_t *p)

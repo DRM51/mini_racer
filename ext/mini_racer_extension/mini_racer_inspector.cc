@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <tuple>
 #include <mutex>
 #include <random>
 #include <vector>
@@ -83,9 +84,16 @@ struct Target
     std::string id, title;
     std::mutex mu;
     std::condition_variable cv;
-    std::deque<std::pair<Event, std::string>> q; // guarded by |mu|
+    // frontend events and the connection each came from; guarded by |mu|
+    std::deque<std::tuple<Event, std::string, std::shared_ptr<Conn>>> q;
     size_t q_bytes = 0;                          // guarded by |mu|
     std::shared_ptr<Conn> conn;                  // guarded by |mu|
+    // The frontend the V8 thread is talking to: set when poll() hands it
+    // that connection's Connect, cleared with its Disconnect. send() writes
+    // only here, not to |conn|: a frontend that attaches while the last
+    // one's commands are still queued sees no replies to them, nor console
+    // entries they replayed. Guarded by |mu|.
+    std::shared_ptr<Conn> session;
     void (*wake)(void *) = nullptr;              // guarded by |mu|
     void *arg = nullptr;
     bool notified = false;                       // guarded by |mu|
@@ -271,10 +279,10 @@ std::string lower(std::string s)
 
 // --- events ---
 
-void push_locked(Target& t, Event ev, std::string msg)
+void push_locked(Target& t, Event ev, std::string msg, const std::shared_ptr<Conn>& from)
 {
     t.q_bytes += msg.size();
-    t.q.emplace_back(ev, std::move(msg));
+    t.q.emplace_back(ev, std::move(msg), from);
     t.cv.notify_all();
     // one wake per batch: the V8 thread drains the whole queue, so a wake
     // (and the interrupt it requests) is only needed when it was empty
@@ -284,12 +292,12 @@ void push_locked(Target& t, Event ev, std::string msg)
 
 // False when the frontend is too far ahead of the V8 thread; the caller
 // drops the connection.
-bool push_message(Target& t, std::string msg)
+bool push_message(Target& t, std::string msg, const std::shared_ptr<Conn>& from)
 {
     std::lock_guard<std::mutex> lock(t.mu);
     if (t.q.size() >= g_max_queued.load() || t.q_bytes + msg.size() > g_max_queued_bytes.load())
         return false;
-    push_locked(t, Event::Message, std::move(msg));
+    push_locked(t, Event::Message, std::move(msg), from);
     return true;
 }
 
@@ -450,7 +458,7 @@ void close_conn(const std::shared_ptr<Conn>& c)
         std::lock_guard<std::mutex> lock(t->mu);
         if (t->conn == c) {
             t->conn.reset();
-            push_locked(*t, Event::Disconnect, std::string());
+            push_locked(*t, Event::Disconnect, std::string(), c);
         }
     }
 }
@@ -590,12 +598,28 @@ bool valid_utf8(const std::string& s)
     return true;
 }
 
+// A close frame's payload: empty, or a status code an endpoint may send
+// (RFC 6455 7.4) and a UTF-8 reason.
+bool valid_close(const std::string& payload)
+{
+    if (payload.empty())
+        return true;
+    if (payload.size() < 2)
+        return false;
+    unsigned code = uint8_t(payload[0]) << 8 | uint8_t(payload[1]);
+    bool known = (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1011) ||
+                 (code >= 3000 && code <= 4999);
+    return known && valid_utf8(payload.substr(2));
+}
+
 // Returns false when the connection should be closed.
 bool handle_http(const std::shared_ptr<Conn>& c)
 {
     size_t end = c->in.find("\r\n\r\n");
     if (end == std::string::npos)
         return c->in.size() < kMaxHttpRequest;
+    if (end + 4 > kMaxHttpRequest)
+        return false; // the read that ended the head also took it past the limit
     std::string head = c->in.substr(0, end);
     c->in.erase(0, end + 4);
 
@@ -620,6 +644,12 @@ bool handle_http(const std::shared_ptr<Conn>& c)
         size_t ve = h.size();
         while (ve > v && (h[ve - 1] == ' ' || h[ve - 1] == '\t')) ve--;
         std::string name = lower(h.substr(0, colon));
+        for (size_t i = v; i < ve && !malformed; i++) {
+            unsigned char ch = h[i];
+            malformed = (ch < 0x20 && ch != '\t') || ch == 0x7F; // RFC 9110 5.5
+        }
+        if (malformed)
+            break;
         if (headers.count(name)) {
             malformed = true; // duplicates are never needed here
             break;
@@ -630,7 +660,8 @@ bool handle_http(const std::shared_ptr<Conn>& c)
     size_t sp2 = sp1 == std::string::npos ? sp1 : line.find(' ', sp1 + 1);
     std::string version = sp2 == std::string::npos ? std::string() : line.substr(sp2 + 1);
     if (malformed || sp2 == std::string::npos ||
-        (version != "HTTP/1.1" && version != "HTTP/1.0")) {
+        (version != "HTTP/1.1" && version != "HTTP/1.0") ||
+        (version == "HTTP/1.1" && !headers.count("host"))) { // RFC 9112 3.2
         send_raw(*c, http_response("400 Bad Request", "{}"));
         return false;
     }
@@ -710,7 +741,7 @@ bool handle_http(const std::shared_ptr<Conn>& c)
             if (t->conn || !t->wake)
                 return false; // lost a race with another frontend, or target gone
             t->conn = c;
-            push_locked(*t, Event::Connect, std::string());
+            push_locked(*t, Event::Connect, std::string(), c);
         }
         c->ws = true;
         c->target = t;
@@ -748,6 +779,8 @@ bool handle_ws(const std::shared_ptr<Conn>& c)
         if (len == 126) {
             if (in.size() < 4) return true;
             len = uint64_t(uint8_t(in[2])) << 8 | uint8_t(in[3]);
+            if (len < 126)
+                return false; // RFC 6455 5.2: the minimal number of bytes
             hdr = 4;
         } else if (len == 127) {
             if (in.size() < 10) return true;
@@ -756,6 +789,8 @@ bool handle_ws(const std::shared_ptr<Conn>& c)
                 len = len << 8 | uint8_t(in[i]);
             if (len >> 63)
                 return false; // RFC 6455 5.2: the top bit must be 0
+            if (len < 65536)
+                return false; // and the minimal number of bytes
             hdr = 10;
         }
         if (op >= 0x8 && (len > 125 || !fin))
@@ -770,12 +805,19 @@ bool handle_ws(const std::shared_ptr<Conn>& c)
         for (size_t i = 0; i < payload.size(); i++)
             payload[i] ^= mask[i % 4];
         c->in.erase(0, hdr + 4 + static_cast<size_t>(len));
+        // a whole message arrived: what follows it gets its own
+        // handshake_timeout (see server_main), not what's left of this one's
+        if (fin && (op < 0x8 || !c->fragmented))
+            c->partial_since = std::chrono::steady_clock::time_point();
 
         switch (op) {
         case 0x8: // close
-            // best effort, and only if nothing is queued ahead of it
+            // best effort, and only if nothing is queued ahead of it:
+            // echo a valid status code (RFC 6455 5.5.1, 7.4), or answer a
+            // malformed close with 1002, protocol error
             if (!has_output(*c)) {
-                std::string f = frame(0x8, payload.substr(0, 2));
+                std::string f = frame(0x8, valid_close(payload) ? payload.substr(0, 2)
+                                                                : std::string("\x03\xea", 2));
                 std::lock_guard<std::mutex> lock(c->wmu);
                 if (!c->closed)
                     (void)::send(c->fd, f.data(), f.size(), 0);
@@ -806,7 +848,7 @@ bool handle_ws(const std::shared_ptr<Conn>& c)
                 if (!valid_utf8(c->frag))
                     return false;
                 if (auto t = c->target.lock())
-                    if (!push_message(*t, std::move(c->frag)))
+                    if (!push_message(*t, std::move(c->frag), c))
                         return false;
                 c->frag.clear();
             }
@@ -943,6 +985,7 @@ void unregister_target(const std::shared_ptr<Target>& t)
         t->wake = nullptr;
         t->arg = nullptr;
         conn = std::move(t->conn);
+        t->session.reset();
         t->q.clear();
         t->q_bytes = 0;
     }
@@ -988,10 +1031,14 @@ Event poll(Target& t, std::string *msg)
         return Event::None;
     auto ev = std::move(t.q.front());
     t.q.pop_front();
-    t.q_bytes -= ev.second.size();
+    t.q_bytes -= std::get<1>(ev).size();
+    if (std::get<0>(ev) == Event::Connect)
+        t.session = std::get<2>(ev);
+    else if (std::get<0>(ev) == Event::Disconnect)
+        t.session.reset(); // even the reply to discardConsoleEntries goes nowhere
     if (msg)
-        *msg = std::move(ev.second);
-    return ev.first;
+        *msg = std::move(std::get<1>(ev));
+    return std::get<0>(ev);
 }
 
 void wait(Target& t, int ms)
@@ -1014,7 +1061,7 @@ void send(Target& t, const std::string& utf8)
     std::shared_ptr<Conn> conn;
     {
         std::lock_guard<std::mutex> lock(t.mu);
-        conn = t.conn;
+        conn = t.session; // see Target::session
     }
     if (conn)
         enqueue_frame(*conn, 0x1, utf8);

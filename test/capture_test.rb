@@ -689,6 +689,23 @@ class MiniRacerCaptureTest < Minitest::Test
     assert_equal 0, capture["expressions"].first["frame"]
   end
 
+  def test_a_reference_error_thrown_by_a_function_in_the_frame_stays_there
+    ctx = new_context(capture_on_throw: { expressions: ["fake()"] })
+    capture = capture_of do
+      ctx.eval(<<~JS)
+        function outer() { const fake = () => "outer's"; inner(); return fake() }
+        function inner() {
+          const fake = () => { throw new ReferenceError("fake is not defined") }
+          throw new Error(typeof fake)
+        }
+        outer()
+      JS
+    end
+    entry = capture["expressions"].first
+    assert_equal 0, entry["frame"], entry
+    assert_equal "ReferenceError: fake is not defined", entry["error"]
+  end
+
   def test_uncaught_exceptions_are_not_printed
     script = <<~RUBY
       require "mini_racer"

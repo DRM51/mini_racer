@@ -872,9 +872,15 @@ class MiniRacerTest < Minitest::Test
       "0.000000000000000000001" => "0.000000000000000000001",
       "NaN" => "NaN",
       "-Infinity" => "-Infinity",
-      # past 1000 places from the point, scientific, never a huge string
+      "-0" => "-0.0",
+      # over 1000 digits before or after the point, scientific, never a
+      # huge string
+      "1e999" => "1#{"0" * 999}.0",
       "1e1001" => "0.1e1002",
-      "1e-1002" => "0.1e-1001"
+      "1e-1000" => "0.#{"0" * 999}1",
+      "1e-1001" => "0.1e-1000",
+      "0.#{"1" * 1000}" => "0.#{"1" * 1000}",
+      "0.#{"1" * 1001}" => "0.#{"1" * 1001}e0"
     }.each do |decimal, text|
       assert_equal text, context.call("echo", BigDecimal(decimal)), decimal
     end
@@ -884,6 +890,38 @@ class MiniRacerTest < Minitest::Test
     )
     context.attach("rubyNumeric", -> { { amount: BigDecimal("1234567.891") } })
     assert_equal "1234567.891", context.eval("rubyNumeric().amount")
+  ensure
+    context&.dispose
+  end
+
+  def test_a_conversion_that_raises_during_a_call_is_raised_and_nothing_breaks
+    require "bigdecimal"
+    context = MiniRacer::Context.new(date: :iso)
+    context.eval("function echo(...values) { return values.length; }")
+    Date.prepend(Module.new do
+      def iso8601(*)
+        raise ArgumentError, "no dates today" if Thread.current[:mini_racer_test_no_dates]
+        super
+      end
+    end)
+    Thread.current[:mini_racer_test_no_dates] = true
+    error = assert_raises(ArgumentError) do
+      context.call("echo", "x" * 100_000, Date.new(2026, 10, 26))
+    end
+    assert_equal "no dates today", error.message
+    Thread.current[:mini_racer_test_no_dates] = nil
+    assert_equal 2, context.call("echo", "x" * 100_000, Date.new(2026, 10, 26))
+  ensure
+    Thread.current[:mini_racer_test_no_dates] = nil
+    context&.dispose
+  end
+
+  def test_an_attach_error_is_held_to_the_value_limit
+    context = MiniRacer::Context.new(max_value_size: 4096)
+    context.eval("Object.defineProperty(globalThis, 'trap', { get() { throw 'x'.repeat(100000) } })")
+    error = assert_raises(MiniRacer::Error) { context.attach("trap.fn", -> { 1 }) }
+    assert_operator error.message.bytesize, :<, 4096
+    assert_equal 2, context.eval("1 + 1")
   ensure
     context&.dispose
   end
