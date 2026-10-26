@@ -92,7 +92,8 @@ enum
     INSPECTOR_READY    = 4, // the frontend sent Runtime.runIfWaitingForDebugger
     INSPECTOR_PAUSED   = 8, // stopped at a breakpoint (Context#inspector_state only)
 };
-void v8_inspector_dispatch(struct State *pst); // v8 thread, while idle
+// v8 thread, while idle: runs one queued frontend event; 1 if there was one
+int v8_inspector_dispatch(struct State *pst);
 void v8_inspector_shutdown(struct State *pst); // v8 thread, without Context.mtx
 int v8_inspector_status(struct State *pst);
 void v8_inspector_break_next(struct State *pst);
