@@ -1329,12 +1329,14 @@ fail:
         // original callback exception for the eventual Ruby-side re-raise.
         c->exception = original_exception;
     }
-    if (NIL_P(r)) {
+    if (!NIL_P(r))
+        w(&s, RSTRING_PTR(r), RSTRING_LEN(r));
+    if (NIL_P(r) || *s.err) { // no message, or too large to send
+        ser_reset(&s);
+        ser_init0(&s);
+        w_byte(&s, 'e');
         err = "Ruby exception";
         w(&s, err, strlen(err));
-    } else {
-        err = RSTRING_PTR(r);
-        w(&s, err, RSTRING_LEN(r));
     }
     goto out;
 }
@@ -2263,7 +2265,10 @@ static int platform_set_flag1(VALUE k, VALUE v)
         buf_init(&flags);
     ok = (*flags.buf != 1);
     if (ok) {
-        buf_put(&flags, p, 1+strlen(p)); // include trailing \0
+        if (buf_put(&flags, p, 1+strlen(p))) { // include trailing \0
+            pthread_mutex_unlock(&flags_mtx);
+            rb_raise(rb_eNoMemError, "MiniRacer::Platform.set_flags!: out of memory");
+        }
         // strip dashes and underscores to reduce the number of variant
         // spellings (--no-single-threaded, --nosingle-threaded,
         // --no_single_threaded, etc.)
@@ -2323,12 +2328,19 @@ void v8_get_flags(char **p, size_t *n)
     pthread_mutex_lock(&flags_mtx);
     if (!flags.len)
         goto out;
-    *p = malloc(flags.len);
-    if (!*p)
-        goto out;
+    if (flags.buf != flags.buf_s) {
+        *p = (char *)flags.buf; // hand the heap buffer over, no copy
+    } else {
+        *p = malloc(flags.len);
+        if (!*p) {
+            // running V8 without the flags asked for (heap limits, say)
+            // would be worse than not running it
+            fprintf(stderr, "mini_racer: out of memory copying V8 flags\n");
+            abort();
+        }
+        memcpy(*p, flags.buf, flags.len);
+    }
     *n = flags.len;
-    memcpy(*p, flags.buf, *n);
-    buf_reset(&flags);
 out:
     buf_init(&flags);
     buf_putc(&flags, 1); // marker to indicate it's been cleared
