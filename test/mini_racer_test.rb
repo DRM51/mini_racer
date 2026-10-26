@@ -2824,6 +2824,17 @@ class MiniRacerTest < Minitest::Test
     end
   end
 
+  def test_a_tiny_value_limit_ends_in_an_error_not_a_loop_or_an_abort
+    context = MiniRacer::Context.new(max_value_size: 64)
+    # neither the result nor the error that says so fits
+    error = assert_raises(MiniRacer::InternalError) { context.eval("'x'.repeat(100)") }
+    assert_includes error.message, "too large to return to Ruby"
+    assert_raises(MiniRacer::InternalError) { context.eval("throw new Error('y'.repeat(200))") }
+    # mini_racer's own replies aren't the script's values
+    assert_operator context.heap_stats.size, :>, 5
+    assert_equal 2, context.eval("1 + 1")
+  end
+
   def test_max_memory_bounds_array_buffers
     context = MiniRacer::Context.new(max_memory: 64 << 20)
     # one buffer over the limit, and many that together are
