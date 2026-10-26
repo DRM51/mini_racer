@@ -962,6 +962,13 @@ bool inspector_drain(Inspector& in)
     bool any = false;
     std::string msg;
     for (;;) {
+        // A frontend that attaches while the last one's command is still
+        // being dispatched (it paused, and this is the pause loop) waits
+        // until that unwinds: the command's reply then goes to no one, and
+        // the old V8 session is dropped rather than handed over.
+        if (in.disconnect_pending && in.dispatch_depth > 0 &&
+            mri::peek(*in.target) == mri::Event::Connect)
+            break;
         mri::Event ev = mri::poll(*in.target, &msg);
         if (ev == mri::Event::None)
             break;
@@ -1780,6 +1787,11 @@ bool names_undefined_identifier(const std::string& error, const std::string& exp
         return false;
     std::string name = error.substr(prefix.size(), error.size() - prefix.size() - suffix.size());
     auto ident = [](unsigned char c) { return std::isalnum(c) || c == '_' || c == '$' || c >= 0x80; };
+    // a plain identifier, since capture_evaluate runs "typeof <name>": a
+    // thrown message like "f() is not defined" must not become a call
+    if (name.empty() || std::isdigit(static_cast<unsigned char>(name[0])) ||
+        !std::all_of(name.begin(), name.end(), ident))
+        return false;
     for (size_t at = expression.find(name); at != std::string::npos; at = expression.find(name, at + 1)) {
         size_t end = at + name.size();
         bool alone = (at == 0 || (!ident(expression[at - 1]) && expression[at - 1] != '.')) &&

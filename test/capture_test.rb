@@ -706,6 +706,26 @@ class MiniRacerCaptureTest < Minitest::Test
     assert_equal "ReferenceError: fake is not defined", entry["error"]
   end
 
+  def test_a_reference_error_naming_a_call_is_not_probed
+    # 20 of them: probing "typeof f()" would call f again and again, and
+    # use up the recording's 100 ms before the last ones were reached
+    expressions = Array.new(20) { |i| "f()#{" " * i}" }
+    ctx = new_context(capture_on_throw: { expressions: expressions })
+    capture = capture_of do
+      ctx.eval(<<~JS)
+        function inner() {
+          const f = () => { throw new ReferenceError("f() is not defined") }
+          throw new Error(typeof f)
+        }
+        inner()
+      JS
+    end
+    capture["expressions"].each do |entry|
+      assert_equal 0, entry["frame"], entry
+      assert_equal "ReferenceError: f() is not defined", entry["error"]
+    end
+  end
+
   def test_uncaught_exceptions_are_not_printed
     script = <<~RUBY
       require "mini_racer"

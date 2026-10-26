@@ -774,6 +774,10 @@ class MiniRacerInspectorTest < Minitest::Test
     new_context(inspector: "close")
     { [1000].pack("n") + "bye" => [1000].pack("n"),
       "" => "",
+      [1012].pack("n") => [1012].pack("n"),             # registered: service restart
+      [1013].pack("n") => [1013].pack("n"),             # try again later
+      [1014].pack("n") => [1014].pack("n"),             # bad gateway
+      [1015].pack("n") => [1002].pack("n"),             # reserved for TLS failures
       [1001].pack("n") + "\xff".b => [1002].pack("n"), # reason not UTF-8
       [999].pack("n") => [1002].pack("n"),              # not a code to send
       [1005].pack("n") => [1002].pack("n"),             # reserved
@@ -835,6 +839,50 @@ class MiniRacerInspectorTest < Minitest::Test
         break if pongs == 11
       end
       exit!(pongs == 11 ? 0 : 1)
+    RUBY
+    _, err, status =
+      Open3.capture3(RbConfig.ruby, "-I", File.expand_path("../lib", __dir__), "-e", script)
+    assert status.success?, err
+  end
+
+  def test_pings_inside_a_stalled_fragmented_message_do_not_keep_it_alive
+    script = <<~RUBY
+      require "mini_racer"
+      require "socket"
+      require "securerandom"
+      port = MiniRacer::Inspector.start(port: 0, handshake_timeout: 0.5)
+      ctx = MiniRacer::Context.new(inspector: "fragments")
+      id = ctx.inspector_target_id
+      sock = TCPSocket.new("127.0.0.1", port)
+      sock.write("GET /\#{id} HTTP/1.1\\r\\nHost: 127.0.0.1:\#{port}\\r\\nUpgrade: websocket\\r\\n" \\
+                 "Connection: Upgrade\\r\\nSec-WebSocket-Key: \#{SecureRandom.base64(16)}\\r\\n" \\
+                 "Sec-WebSocket-Version: 13\\r\\n\\r\\n")
+      nil while sock.gets != "\\r\\n"
+      # the first fragment of a text message (no FIN), then only pings
+      sock.write([0x01, 0x80 | 2].pack("CC") + "\\0\\0\\0\\0{a")
+      ping = [0x89, 0x80 | 4].pack("CC") + "\\0\\0\\0\\0ping"
+      t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      closed = false
+      20.times do
+        sleep 0.1
+        begin
+          sock.write(ping)
+        rescue Errno::EPIPE, Errno::ECONNRESET
+          closed = true
+          break
+        end
+        while sock.wait_readable(0)
+          head = sock.read_nonblock(2, exception: false)
+          if head.nil? || head == :wait_readable
+            closed = head.nil?
+            break
+          end
+          sock.read(head.getbyte(1) & 0x7f)
+        end
+        break if closed
+      end
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t
+      exit!(closed && elapsed < 1.5 ? 0 : 1)
     RUBY
     _, err, status =
       Open3.capture3(RbConfig.ruby, "-I", File.expand_path("../lib", __dir__), "-e", script)
@@ -907,9 +955,37 @@ class MiniRacerInspectorTest < Minitest::Test
     second.command("Runtime.enable")
     ctx.eval("console.log('session two')")
     assert_equal "session two", second.wait_event("Runtime.consoleAPICalled")["args"][0]["value"]
-    # neither the reply to the first frontend's enable nor what it replayed
-    assert_empty second.events.select { |m| m["id"] == 777 }
+    # neither the reply to the first frontend's enable nor what it replayed,
+    # nor the reply to the discardConsoleEntries sent when it left
+    assert_empty second.events.select { |m| [777, -1].include?(m["id"]) }
     assert_empty(second.events.select { |m| m.to_s.include?("left by session one") })
+  end
+
+  def test_a_frontend_that_attaches_during_the_last_ones_paused_command_gets_none_of_its_replies
+    ctx = new_context(inspector: "paused-handover")
+    first = attach_like_devtools("paused-handover")
+    # a command that pauses: its reply comes only once the pause ends
+    first.send_text(JSON.generate(id: 4242, method: "Runtime.evaluate", params: { expression: "debugger; 'done'" }))
+    frame = first.wait_event("Debugger.paused")["callFrames"][0]["callFrameId"]
+    # keep V8 busy inside the pause while the frontends change over, so it
+    # finds the old one's Disconnect and the new one's Connect together
+    first.send_text(JSON.generate(id: 4243, method: "Debugger.evaluateOnCallFrame",
+                                  params: { callFrameId: frame, expression: "for (const t = Date.now(); Date.now() - t < 800;); 1" }))
+    sleep 0.1
+    first.close
+    @clients.delete(first)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+    begin
+      second = connect("paused-handover")
+    rescue RuntimeError # 409 until the server has seen the close
+      raise if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+      sleep 0.01
+      retry
+    end
+    assert_equal 42, second.command("Runtime.evaluate", expression: "6 * 7")["result"]["value"]
+    second.command("Runtime.enable")
+    assert_empty second.events.select { |m| [4242, 4243, -1].include?(m["id"]) }
+    refute ctx.eval("1; false") # the context carries on
   end
 
   def test_stop_during_a_blocked_callback_and_a_pause

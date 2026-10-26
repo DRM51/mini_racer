@@ -53,9 +53,14 @@ std::atomic<size_t> g_max_queued_bytes{64u << 20};
 std::atomic<size_t> g_max_queued{4096};
 std::atomic<size_t> g_max_targets{0}; // 0: no cap
 
+std::atomic<uint64_t> g_next_conn_id{1};
+
 struct Conn
 {
     int fd;
+    // names the connection in queued events and Target::session, which
+    // must not keep a closed connection (and its buffers) alive
+    const uint64_t id = g_next_conn_id.fetch_add(1);
     std::mutex wmu;       // serializes writes; guards |closed| and the queue
     bool closed = false;
     // WebSocket frames waiting to be written, oldest first; the server
@@ -84,16 +89,17 @@ struct Target
     std::string id, title;
     std::mutex mu;
     std::condition_variable cv;
-    // frontend events and the connection each came from; guarded by |mu|
-    std::deque<std::tuple<Event, std::string, std::shared_ptr<Conn>>> q;
+    // frontend events and the id of the connection each came from;
+    // guarded by |mu|
+    std::deque<std::tuple<Event, std::string, uint64_t>> q;
     size_t q_bytes = 0;                          // guarded by |mu|
     std::shared_ptr<Conn> conn;                  // guarded by |mu|
-    // The frontend the V8 thread is talking to: set when poll() hands it
-    // that connection's Connect, cleared with its Disconnect. send() writes
-    // only here, not to |conn|: a frontend that attaches while the last
-    // one's commands are still queued sees no replies to them, nor console
-    // entries they replayed. Guarded by |mu|.
-    std::shared_ptr<Conn> session;
+    // The id of the frontend the V8 thread is talking to: set when poll()
+    // hands it that connection's Connect, zero after its Disconnect. send()
+    // writes to |conn| only while it's that one: a frontend that attaches
+    // while the last one's commands are still queued sees no replies to
+    // them, nor console entries they replayed. Guarded by |mu|.
+    uint64_t session = 0;
     void (*wake)(void *) = nullptr;              // guarded by |mu|
     void *arg = nullptr;
     bool notified = false;                       // guarded by |mu|
@@ -282,7 +288,7 @@ std::string lower(std::string s)
 void push_locked(Target& t, Event ev, std::string msg, const std::shared_ptr<Conn>& from)
 {
     t.q_bytes += msg.size();
-    t.q.emplace_back(ev, std::move(msg), from);
+    t.q.emplace_back(ev, std::move(msg), from->id);
     t.cv.notify_all();
     // one wake per batch: the V8 thread drains the whole queue, so a wake
     // (and the interrupt it requests) is only needed when it was empty
@@ -607,7 +613,7 @@ bool valid_close(const std::string& payload)
     if (payload.size() < 2)
         return false;
     unsigned code = uint8_t(payload[0]) << 8 | uint8_t(payload[1]);
-    bool known = (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1011) ||
+    bool known = (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) ||
                  (code >= 3000 && code <= 4999);
     return known && valid_utf8(payload.substr(2));
 }
@@ -724,6 +730,12 @@ bool handle_http(const std::shared_ptr<Conn>& c)
             std::lock_guard<std::mutex> lock(t->mu);
             if (t->conn) {
                 send_raw(*c, http_response("409 Conflict", "{\"error\":\"a debugger is already attached\"}"));
+                return false;
+            }
+            // Connect and Disconnect bypass push_message's limits; while V8
+            // is busy, reconnecting over and over could grow the queue
+            if (t->q.size() >= g_max_queued.load()) {
+                send_raw(*c, http_response("503 Service Unavailable", "{\"error\":\"the context is busy\"}"));
                 return false;
             }
         }
@@ -985,7 +997,7 @@ void unregister_target(const std::shared_ptr<Target>& t)
         t->wake = nullptr;
         t->arg = nullptr;
         conn = std::move(t->conn);
-        t->session.reset();
+        t->session = 0;
         t->q.clear();
         t->q_bytes = 0;
     }
@@ -1035,10 +1047,16 @@ Event poll(Target& t, std::string *msg)
     if (std::get<0>(ev) == Event::Connect)
         t.session = std::get<2>(ev);
     else if (std::get<0>(ev) == Event::Disconnect)
-        t.session.reset(); // even the reply to discardConsoleEntries goes nowhere
+        t.session = 0; // even the reply to discardConsoleEntries goes nowhere
     if (msg)
         *msg = std::move(std::get<1>(ev));
     return std::get<0>(ev);
+}
+
+Event peek(Target& t)
+{
+    std::lock_guard<std::mutex> lock(t.mu);
+    return t.q.empty() ? Event::None : std::get<0>(t.q.front());
 }
 
 void wait(Target& t, int ms)
@@ -1061,7 +1079,8 @@ void send(Target& t, const std::string& utf8)
     std::shared_ptr<Conn> conn;
     {
         std::lock_guard<std::mutex> lock(t.mu);
-        conn = t.session; // see Target::session
+        if (t.conn && t.conn->id == t.session) // see Target::session
+            conn = t.conn;
     }
     if (conn)
         enqueue_frame(*conn, 0x1, utf8);

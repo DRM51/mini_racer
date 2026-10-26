@@ -32,6 +32,8 @@ bool disconnect(const std::string& id);
 
 // Pops the next frontend event; *msg is set for Event::Message.
 Event poll(Target& t, std::string *msg);
+// The next event's kind, left queued.
+Event peek(Target& t);
 // Blocks for at most |ms| milliseconds or until an event or notify().
 void wait(Target& t, int ms);
 void notify(Target& t);
