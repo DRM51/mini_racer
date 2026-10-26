@@ -906,18 +906,27 @@ class MiniRacerInspectorTest < Minitest::Test
     client = attach_like_devtools("resume-backlog")
     th = Thread.new { ctx.eval("debugger; for (const t = Date.now(); Date.now() - t < 2000;); 'done'") }
     frame = client.wait_event("Debugger.paused")["callFrames"][0]["callFrameId"]
-    # A nested evaluation runs JavaScript in the pause, which spends the
-    # interrupt the frontend's wake asked for (it does nothing while
-    # paused). Then the resume, and more than a pause batch (64) behind it:
-    # the rest are still queued when the pause ends, with no interrupt left.
+    # A nested evaluation runs JavaScript in the pause for 500 ms: the rest,
+    # sent in the same write, are all queued by the time it returns, and the
+    # interrupts their wakes asked for are spent inside it (they do nothing
+    # while paused). The batch then runs the resume and 62 more (64 in all);
+    # the other 38 are still queued when the pause ends, with no interrupt
+    # left to bring them.
     nested = JSON.generate(id: 998, method: "Debugger.evaluateOnCallFrame",
-                           params: { callFrameId: frame, expression: "for (let i = 0; i < 1e6; i++); 1" })
+                           params: { callFrameId: frame, expression: "for (const t = Date.now(); Date.now() - t < 500;); 1" })
     commands = Array.new(100) { |i| JSON.generate(id: 1000 + i, method: "Runtime.evaluate", params: { expression: i.to_s }) }
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     client.send_texts(nested, JSON.generate(id: 999, method: "Debugger.resume", params: {}), *commands)
     assert_equal 99, client.wait_response(1099, timeout: 5)["result"]["value"]
     # answered while the resumed script runs, not after its 2 s
     assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 1.5
+    # and the case was the one meant: V8 says it resumed once the pause loop
+    # returns, so the 38 answered after that were the ones left queued (1099,
+    # the last, was taken by wait_response)
+    seen = client.events
+    resumed = seen.index { |e| e["method"] == "Debugger.resumed" }
+    refute_nil resumed
+    assert_equal (1062..1098).to_a, seen[resumed..].filter_map { |e| e["id"] }
     assert_equal "done", th.value
   end
 
