@@ -176,6 +176,7 @@ typedef struct Context
     char inspector_title[256];
     int64_t max_pause;           // ms a breakpoint may hold the caller; 0 = no cap
     int inspector_pending;       // protected by |mtx|
+    int inspector_retry_ms;      // v8 thread: dispatch_inspector's backoff
     atomic_int dbg_paused;       // v8 thread is stopped at a breakpoint
     atomic_llong dbg_paused_ms;  // total time spent paused; the watchdog
                                  // does not count it against |timeout|
@@ -996,8 +997,11 @@ static int v8_watched(Context *c, const uint8_t *p, size_t n,
     r = pthread_create(&thr, NULL, v8_watchdog, c);
     if (r) {
         c->wd.active = 0;
-        fprintf(stderr, "mini_racer: watchdog: pthread_create: %s\n", strerror(r));
-        fflush(stderr);
+        // once per run of failures on the idle path, which retries
+        if (!strict || !c->inspector_retry_ms) {
+            fprintf(stderr, "mini_racer: watchdog: pthread_create: %s\n", strerror(r));
+            fflush(stderr);
+        }
         if (strict)
             return -1;
     }
@@ -1100,11 +1104,19 @@ static void dispatch_inspector(Context *c)
         r = v8_watched(c, (const uint8_t *)&more, 0, inspector_dispatch_timed, true);
         pthread_mutex_lock(&c->mtx);
         if (r < 0) {
+            // back off, 100 ms doubling to 2 s, unless a request or quit
+            // is already waiting
             c->inspector_pending = 1;
-            deadline = deadline_ms(100);
-            pthread_cond_timedwait(&c->cv, &c->mtx, &deadline);
+            c->inspector_retry_ms = c->inspector_retry_ms ? c->inspector_retry_ms * 2 : 100;
+            if (c->inspector_retry_ms > 2000)
+                c->inspector_retry_ms = 2000;
+            if (!c->req.len && !c->quit) {
+                deadline = deadline_ms(c->inspector_retry_ms);
+                pthread_cond_timedwait(&c->cv, &c->mtx, &deadline);
+            }
             return;
         }
+        c->inspector_retry_ms = 0;
         if (more && (c->req.len || c->quit)) {
             c->inspector_pending = 1;
             return;
