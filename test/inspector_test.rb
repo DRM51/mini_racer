@@ -104,17 +104,31 @@ class CdpClient
   end
 
   def wait_response(id, timeout: 5)
+    wait_message(id, timeout: timeout)["result"]
+  end
+
+  # the whole reply, "error" included
+  def wait_message(id, timeout: 5)
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
     loop do
       left = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
       raise "timed out waiting for response #{id}" if left <= 0
       msg = read_message(left)
-      return msg["result"] if msg && msg["id"] == id
+      return msg if msg && msg["id"] == id
       @events << msg if msg
     end
   end
 
   def send_frame(opcode, payload)
+    @sock.write(frame_bytes(opcode, payload))
+  end
+
+  # several text messages in one write, so they're queued together
+  def send_texts(*texts)
+    @sock.write(texts.map { |t| frame_bytes(0x1, t) }.join)
+  end
+
+  def frame_bytes(opcode, payload)
     payload = payload.b
     mask = SecureRandom.random_bytes(4).bytes
     header = [0x80 | opcode].pack("C")
@@ -128,7 +142,7 @@ class CdpClient
         [0x80 | 127, n].pack("CQ>")
       end
     masked = payload.bytes.each_with_index.map { |b, i| b ^ mask[i % 4] }
-    @sock.write(header + mask.pack("C*") + masked.pack("C*"))
+    header + mask.pack("C*") + masked.pack("C*")
   end
 
   private
@@ -845,6 +859,40 @@ class MiniRacerInspectorTest < Minitest::Test
     assert status.success?, err
   end
 
+  def test_a_backlog_of_debugger_commands_does_not_hold_up_an_eval
+    ctx = new_context(inspector: "fair", timeout: 5000)
+    client = connect("fair")
+    # about 6 s of work queued at once, 30 ms a command
+    client.send_texts(*Array.new(200) { |i|
+      JSON.generate(id: 100 + i, method: "Runtime.evaluate",
+                    params: { expression: "for (const t = Date.now(); Date.now() - t < 30;); #{i}" })
+    })
+    sleep 0.2 # the V8 thread is working through them
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    assert_equal 2, ctx.eval("1 + 1")
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 1.5,
+                    "the eval went ahead of the queued commands"
+    # and the commands still run after it
+    assert_equal 199, client.wait_response(299, timeout: 15)["result"]["value"]
+  end
+
+  def test_two_endless_commands_in_a_pause_both_end
+    ctx = new_context(inspector: "nested-two", timeout: 1000, max_pause: 1500)
+    client = attach_like_devtools("nested-two")
+    th = Thread.new do
+      ctx.eval("debugger; 'after'")
+    rescue MiniRacer::Error => e
+      e
+    end
+    frame = client.wait_event("Debugger.paused")["callFrames"][0]["callFrameId"]
+    endless = { callFrameId: frame, expression: "for (;;) {}" }
+    client.send_texts(JSON.generate(id: 20, method: "Debugger.evaluateOnCallFrame", params: endless),
+                      JSON.generate(id: 21, method: "Debugger.evaluateOnCallFrame", params: endless))
+    # max_pause ends the pause and what runs in it, the second command too
+    assert th.join(8), "the eval never returned: a nested command ran unwatched"
+    assert_equal 2, ctx.eval("1 + 1")
+  end
+
   def test_reconnecting_while_the_context_is_busy_is_refused_at_the_queue_cap
     script = <<~'RUBY'
       require "mini_racer"
@@ -1057,12 +1105,12 @@ class MiniRacerInspectorTest < Minitest::Test
     ctx = new_context(inspector: "idle-timeout", timeout: 300)
     client = connect("idle-timeout")
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    # two queued together: each gets its own 300 ms, not one between them
-    [9, 10].each do |id|
-      client.send_text(JSON.generate(id: id, method: "Runtime.evaluate", params: { expression: "for (;;) {}" }))
-    end
-    client.wait_response(9, timeout: 5)
-    client.wait_response(10, timeout: 5)
+    # queued together: the endless one is stopped at its 300 ms, and the next
+    # still runs, under its own watchdog, rather than not at all
+    client.send_texts(JSON.generate(id: 9, method: "Runtime.evaluate", params: { expression: "for (;;) {}" }),
+                      JSON.generate(id: 10, method: "Runtime.evaluate", params: { expression: "6 * 7" }))
+    assert_equal "Execution was terminated", client.wait_message(9)["error"]["message"]
+    assert_equal 42, client.wait_response(10, timeout: 5)["result"]["value"]
     assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 4
     assert_equal 2, ctx.eval("1 + 1") # and the termination doesn't leak into the next eval
   end
