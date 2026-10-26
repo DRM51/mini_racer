@@ -979,15 +979,18 @@ static void *v8_watchdog(void *arg)
     return NULL;
 }
 
-static void v8_timedwait(Context *c, const uint8_t *p, size_t n,
-                         void (*func)(struct State *pst, const uint8_t *p, size_t n))
+// Runs |func| under the timeout: watchdog. When the watchdog thread can't
+// be started, |strict| returns -1 without running |func|; otherwise it runs
+// unwatched, as it always has for evals (their reply must be sent).
+static int v8_watched(Context *c, const uint8_t *p, size_t n,
+                      void (*func)(struct State *pst, const uint8_t *p, size_t n), bool strict)
 {
     pthread_t thr;
     int r;
 
     if (c->timeout <= 0 || c->wd.active) {
         func(c->pst, p, n);
-        return;
+        return 0;
     }
     c->wd.active = 1;
     r = pthread_create(&thr, NULL, v8_watchdog, c);
@@ -995,10 +998,12 @@ static void v8_timedwait(Context *c, const uint8_t *p, size_t n,
         c->wd.active = 0;
         fprintf(stderr, "mini_racer: watchdog: pthread_create: %s\n", strerror(r));
         fflush(stderr);
+        if (strict)
+            return -1;
     }
     func(c->pst, p, n);
     if (r)
-        return;
+        return 0;
     pthread_mutex_lock(&c->wd.mtx);
     c->wd.cancel = 1;
     pthread_cond_signal(&c->wd.cv);
@@ -1007,6 +1012,13 @@ static void v8_timedwait(Context *c, const uint8_t *p, size_t n,
     v8_cancel_watchdog_termination(c->pst);
     c->wd.cancel = 0;
     c->wd.active = 0;
+    return 0;
+}
+
+static void v8_timedwait(Context *c, const uint8_t *p, size_t n,
+                         void (*func)(struct State *pst, const uint8_t *p, size_t n))
+{
+    v8_watched(c, p, n, func, false);
 }
 
 // A frontend's command while the context is idle (Runtime.evaluate from the
@@ -1071,6 +1083,35 @@ static void dispatch(Context *c)
     dispatch_buf(c, &c->req);
 }
 
+// Frontend commands while idle, one per watchdog (inspector_dispatch_timed).
+// Called and returns with |mtx| held. It stops, leaving the rest pending,
+// when a Ruby request or quit is waiting, so a frontend that keeps sending
+// can't starve evals; and when a command's watchdog can't start, it runs
+// nothing and retries shortly, rather than run the command unbounded.
+static void dispatch_inspector(Context *c)
+{
+    struct timespec deadline;
+    int more = 1;
+    int r;
+
+    c->inspector_pending = 0;
+    while (more) {
+        pthread_mutex_unlock(&c->mtx);
+        r = v8_watched(c, (const uint8_t *)&more, 0, inspector_dispatch_timed, true);
+        pthread_mutex_lock(&c->mtx);
+        if (r < 0) {
+            c->inspector_pending = 1;
+            deadline = deadline_ms(100);
+            pthread_cond_timedwait(&c->cv, &c->mtx, &deadline);
+            return;
+        }
+        if (more && (c->req.len || c->quit)) {
+            c->inspector_pending = 1;
+            return;
+        }
+    }
+}
+
 // called by v8_isolate_and_context
 void v8_thread_main(Context *c, struct State *pst)
 {
@@ -1093,12 +1134,9 @@ void v8_thread_main(Context *c, struct State *pst)
                 pthread_cond_wait(&c->cv, &c->mtx);
             }
         }
-        if (c->inspector_pending) {
-            c->inspector_pending = 0;
-            pthread_mutex_unlock(&c->mtx);
-            for (int more = 1; more; )
-                v8_timedwait(c, (const uint8_t *)&more, 0, inspector_dispatch_timed);
-            pthread_mutex_lock(&c->mtx);
+        // a queued Ruby request goes first, see dispatch_inspector
+        if (c->inspector_pending && !c->req.len) {
+            dispatch_inspector(c);
             continue;
         }
         if (!c->req.len)
