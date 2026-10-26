@@ -919,6 +919,29 @@ class MiniRacerTest < Minitest::Test
     context&.dispose
   end
 
+  def test_a_conversion_that_raises_during_a_call_frees_what_was_serialized
+    skip "measures this process's memory" unless File.exist?("/proc/self/status") || RUBY_PLATFORM.include?("darwin")
+    script = <<~'RUBY'
+      require "mini_racer"
+      require "date"
+      Date.prepend(Module.new { def iso8601(*) = raise(ArgumentError, "no dates today") })
+      def rss_mb = Integer(`ps -o rss= -p #{Process.pid}`) / 1024
+      context = MiniRacer::Context.new(date: :iso)
+      context.eval("function echo() {}")
+      # random, so macOS can't compress a leaked copy out of the RSS
+      big = Random.new(1).bytes(25 << 20).unpack1("H*")
+      before = rss_mb
+      # each call serializes 50 MB before the conversion raises
+      20.times { context.call("echo", big, Date.new(2026, 10, 26)) rescue nil }
+      grown = rss_mb - before
+      warn "grew #{grown} MB" if grown >= 300
+      exit!(grown < 300 ? 0 : 1)
+    RUBY
+    _, err, status =
+      Open3.capture3(RbConfig.ruby, "-I", File.expand_path("../lib", __dir__), "-e", script)
+    assert status.success?, err
+  end
+
   def test_an_attach_error_is_held_to_the_value_limit
     context = MiniRacer::Context.new(max_value_size: 4096)
     context.eval("Object.defineProperty(globalThis, 'trap', { get() { throw 'x'.repeat(100000) } })")
