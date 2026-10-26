@@ -386,7 +386,7 @@ module MiniRacer
       when MiniRacer::Binary
         @js_new_uint8array_func.call(value.data.bytes)
       else
-        if @decimal_float && defined?(BigDecimal) && value.is_a?(BigDecimal)
+        if @decimal_float && defined?(BigDecimal) && value.instance_of?(BigDecimal)
           value.to_f
         else
           "Undefined Conversion"
