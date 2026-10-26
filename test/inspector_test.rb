@@ -691,7 +691,7 @@ class MiniRacerInspectorTest < Minitest::Test
       # a connection that never sends its request is dropped
       sock = TCPSocket.new("127.0.0.1", port)
       t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      checks << (sock.wait_readable(5) && (sock.read_nonblock(1, exception: false) rescue nil).nil?) # a reset is closed too
+      checks << (sock.wait_readable(5) && (begin; sock.read_nonblock(1, exception: false); rescue Errno::ECONNRESET; nil; end).nil?) # a reset is closed too
       checks << (Process.clock_gettime(Process::CLOCK_MONOTONIC) - t < 3)
       puts checks.inspect
       exit!(checks.all? ? 0 : 1)
@@ -819,7 +819,7 @@ class MiniRacerInspectorTest < Minitest::Test
       nil while sock.gets != "\\r\\n"
       sock.write([0x81, 0x80 | 100].pack("CC") + "mask" + "x" * 10) # 10 of 100 bytes
       t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      closed = sock.wait_readable(5) && (sock.read_nonblock(1, exception: false) rescue nil).nil? # a reset is closed too
+      closed = sock.wait_readable(5) && (begin; sock.read_nonblock(1, exception: false); rescue Errno::ECONNRESET; nil; end).nil? # a reset is closed too
       elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t
       exit!(closed && elapsed < 3 ? 0 : 1)
     RUBY
@@ -892,10 +892,11 @@ class MiniRacerInspectorTest < Minitest::Test
     # both answer, and the eval returns
     replies = [20, 21].map { |id| client.wait_message(id, timeout: 8) }
     assert_equal [20, 21], replies.map { _1["id"] }
-    # the first is terminated by max_pause; the second never runs: by then
-    # the pause is over and V8 refuses it (an error, never a result)
+    # the first is terminated by max_pause; V8 refuses the second (-32603),
+    # with no result: it never ran
     assert_equal "Execution was terminated", replies[0].dig("error", "message"), replies[0]
-    assert replies[1]["error"], "the second command was refused, not run: #{replies[1]}"
+    assert_equal [-32603, "Internal error"], [replies[1].dig("error", "code"), replies[1].dig("error", "message")], replies[1]
+    assert_nil replies[1]["result"]
     assert th.join(8), "the eval never returned: a nested command ran unwatched"
     assert_equal 2, ctx.eval("1 + 1")
   end

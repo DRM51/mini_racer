@@ -34,6 +34,8 @@ bool disconnect(const std::string& id);
 // |hold_connect|, a Connect at the front stays queued and None is returned,
 // decided under the same lock as the pop.
 Event poll(Target& t, std::string *msg, bool hold_connect = false);
+// Whether anything is queued; a hint, for asking to be woken again.
+bool pending(Target& t);
 // Blocks for at most |ms| milliseconds or until an event or notify().
 void wait(Target& t, int ms);
 void notify(Target& t);

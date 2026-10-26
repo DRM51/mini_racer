@@ -1040,6 +1040,8 @@ size_t inspector_drain(Inspector& in, size_t max = SIZE_MAX)
     return any;
 }
 
+void inspector_interrupt(v8::Isolate *, void *arg); // below
+
 void InspectorClient::runMessageLoopOnPause(int)
 {
     // Not again for a frontend that has gone: its command, resumed when it
@@ -1078,6 +1080,12 @@ void InspectorClient::runMessageLoopOnPause(int)
     }
     in.paused = false;
     v8_inspector_paused(st.ruby_context, 0);
+    // Events left when the pause ended (a resume inside a batch) would wait
+    // for the resumed JavaScript to finish: a push onto a queue that isn't
+    // empty doesn't wake anyone, and the interrupt that brought them may be
+    // spent. Ask again, so they run as soon as the JavaScript does.
+    if (mri::pending(*in.target))
+        st.isolate->RequestInterrupt(inspector_interrupt, &st);
 }
 
 void inspector_interrupt(v8::Isolate *, void *arg)
