@@ -1,3 +1,8 @@
+- 0.22.2.11 - 26-10-2026
+  - DRM51 build: 0.22.2.10 plus the changes below
+  - The `max_memory:` guard against resizable buffers reads `maxByteLength` once and passes V8 only the length, so an options object can no longer answer differently the second time
+  - `Inspector.stop` keeps checking the token until the server thread has exited; count and size settings must be whole numbers
+
 - 0.22.2.10 - 26-10-2026
   - DRM51 build: 0.22.2.9 plus the changes below
   - A reply that can't be returned to Ruby (too large, out of memory) becomes an internal error instead of ending the process; `Platform.set_flags!` raises `NoMemoryError` instead of dropping a flag; an oversized callback error message is replaced instead of sent empty
