@@ -14,6 +14,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -26,25 +27,29 @@ namespace mini_racer_inspector {
 
 namespace {
 
-// Largest WebSocket message accepted from a frontend. Protocol messages are
-// small; the cap only bounds memory if something else talks to the port.
-constexpr uint64_t kMaxMessage = 16u << 20;
 constexpr size_t kMaxHttpRequest = 64u << 10;
-constexpr size_t kMaxConns = 32;
-// A frontend that stops or slows down reading must not stall the V8 thread
-// (which sends protocol messages synchronously) or the server thread for
-// long: a message that makes no progress for kSendIdleMs, or takes longer
-// than kSendTotalMs in all, drops the connection.
-constexpr int kSendIdleMs = 10 * 1000;
-constexpr int kSendTotalMs = 30 * 1000;
-// A connection must finish its HTTP request (or WebSocket handshake) this
-// quickly, so idle sockets can't hold every kMaxConns slot.
-constexpr int kHandshakeMs = 10 * 1000;
-// Messages waiting for the V8 thread, per target. A frontend that keeps
-// sending while V8 is busy (in a long Ruby callback, say) is disconnected
-// instead of growing native memory that the heap limit doesn't see.
-constexpr size_t kMaxQueuedBytes = 64u << 20;
-constexpr size_t kMaxQueued = 4096;
+
+// The rest are Settings (see the header for each), read by the server and V8
+// threads while start_server may change them, hence atomics. Defaults:
+// - max_message: largest WebSocket message from a frontend; protocol
+//   messages are small, the cap only bounds memory
+// - send_idle_ms / send_total_ms: a frontend that stops or slows down
+//   reading must not stall the V8 thread (which sends synchronously) or the
+//   server thread: a message that makes no progress for send_idle_ms, or
+//   takes longer than send_total_ms in all, drops the connection
+// - handshake_ms: a connection must finish its HTTP request or WebSocket
+//   handshake this quickly, so idle sockets can't hold every slot
+// - max_queued / max_queued_bytes: messages waiting for the V8 thread, per
+//   target; a frontend that keeps sending while V8 is busy is disconnected
+//   instead of growing memory the heap limit doesn't see
+std::atomic<uint64_t> g_max_message{16u << 20};
+std::atomic<size_t> g_max_conns{32};
+std::atomic<int> g_send_idle_ms{10 * 1000};
+std::atomic<int> g_send_total_ms{30 * 1000};
+std::atomic<int> g_handshake_ms{10 * 1000};
+std::atomic<size_t> g_max_queued_bytes{64u << 20};
+std::atomic<size_t> g_max_queued{4096};
+std::atomic<size_t> g_max_targets{0}; // 0: no cap
 
 struct Conn
 {
@@ -86,6 +91,11 @@ std::string g_host;
 std::string g_prefix; // "/<token>" when started with a token, else empty
 int g_port = -1;
 int g_lfd = -1;
+// stop_server writes to g_wake_w; the server thread then closes everything
+// and exits, and stop_server joins it
+int g_wake_r = -1, g_wake_w = -1;
+pthread_t g_thread;
+bool g_thread_running = false;
 
 // fork() only copies the calling thread: the server thread and every V8
 // thread are gone in the child, and any lock they held stays held. Take
@@ -102,7 +112,12 @@ void atfork_child()
     g_conn_fds.clear();
     if (g_lfd >= 0)
         close(g_lfd);
-    g_lfd = -1;
+    if (g_wake_r >= 0)
+        close(g_wake_r);
+    if (g_wake_w >= 0)
+        close(g_wake_w);
+    g_lfd = g_wake_r = g_wake_w = -1;
+    g_thread_running = false; // the thread didn't survive the fork
     g_port = -1;
     g_prefix.clear();
     g_mu.unlock();
@@ -250,7 +265,7 @@ void push_locked(Target& t, Event ev, std::string msg)
 bool push_message(Target& t, std::string msg)
 {
     std::lock_guard<std::mutex> lock(t.mu);
-    if (t.q.size() >= kMaxQueued || t.q_bytes + msg.size() > kMaxQueuedBytes)
+    if (t.q.size() >= g_max_queued.load() || t.q_bytes + msg.size() > g_max_queued_bytes.load())
         return false;
     push_locked(t, Event::Message, std::move(msg));
     return true;
@@ -258,7 +273,7 @@ bool push_message(Target& t, std::string msg)
 
 // --- sockets ---
 
-// Caller holds c.wmu. Sockets are non-blocking; see kSendIdleMs.
+// Caller holds c.wmu. Sockets are non-blocking; see g_send_idle_ms.
 bool write_all(Conn& c, const char *p, size_t n)
 {
 #ifdef MSG_NOSIGNAL
@@ -267,7 +282,8 @@ bool write_all(Conn& c, const char *p, size_t n)
     const int flags = 0; // SO_NOSIGPIPE is set on accept
 #endif
     using clock = std::chrono::steady_clock;
-    const auto deadline = clock::now() + std::chrono::milliseconds(kSendTotalMs);
+    const int idle_ms = g_send_idle_ms.load();
+    const auto deadline = clock::now() + std::chrono::milliseconds(g_send_total_ms.load());
     while (n > 0) {
         ssize_t r = ::send(c.fd, p, n, flags);
         if (r >= 0) {
@@ -283,7 +299,7 @@ bool write_all(Conn& c, const char *p, size_t n)
         if (left <= 0)
             return false;
         pollfd pfd{c.fd, POLLOUT, 0};
-        if (::poll(&pfd, 1, static_cast<int>(left < kSendIdleMs ? left : kSendIdleMs)) == 0)
+        if (::poll(&pfd, 1, static_cast<int>(left < idle_ms ? left : idle_ms)) == 0)
             return false;
     }
     return true;
@@ -571,7 +587,8 @@ bool handle_ws(const std::shared_ptr<Conn>& c)
         }
         if (op >= 0x8 && (len > 125 || !fin))
             return false; // RFC 6455 5.5: control frames are short and unfragmented
-        if (len > kMaxMessage || c->frag.size() + len > kMaxMessage)
+        const uint64_t max_message = g_max_message.load();
+        if (len > max_message || c->frag.size() + len > max_message)
             return false;
         if (in.size() < hdr + 4 + len)
             return true;
@@ -622,13 +639,18 @@ bool handle_read(const std::shared_ptr<Conn>& c)
     return c->ws ? handle_ws(c) : handle_http(c);
 }
 
+struct ServerFds { int lfd, wake; };
+
 void *server_main(void *arg)
 {
-    int lfd = static_cast<int>(reinterpret_cast<intptr_t>(arg));
+    ServerFds fds = *static_cast<ServerFds *>(arg);
+    delete static_cast<ServerFds *>(arg);
+    const int lfd = fds.lfd;
     std::vector<std::shared_ptr<Conn>> conns;
     for (;;) {
         std::vector<pollfd> pfds;
         pfds.push_back({lfd, POLLIN, 0});
+        pfds.push_back({fds.wake, POLLIN, 0});
         for (auto& c : conns)
             pfds.push_back({c->fd, POLLIN, 0});
         // wake up now and then to expire connections that never finished
@@ -637,15 +659,23 @@ void *server_main(void *arg)
             if (errno == EINTR) continue;
             return nullptr;
         }
+        if (pfds[1].revents) { // stop_server
+            for (auto& c : conns)
+                close_conn(c); // each target sees Event::Disconnect
+            close(lfd);
+            close(fds.wake);
+            return nullptr;
+        }
         const auto now = std::chrono::steady_clock::now();
+        const auto handshake = std::chrono::milliseconds(g_handshake_ms.load());
         std::vector<std::shared_ptr<Conn>> keep;
-        for (size_t i = 1; i < pfds.size(); i++) {
-            auto& c = conns[i - 1];
+        for (size_t i = 2; i < pfds.size(); i++) {
+            auto& c = conns[i - 2];
             if (pfds[i].revents && !handle_read(c)) {
                 close_conn(c);
                 continue;
             }
-            if (!c->ws && now - c->accepted >= std::chrono::milliseconds(kHandshakeMs)) {
+            if (!c->ws && now - c->accepted >= handshake) {
                 close_conn(c);
                 continue;
             }
@@ -655,7 +685,7 @@ void *server_main(void *arg)
         if (pfds[0].revents & POLLIN) {
             std::lock_guard<std::mutex> lock(g_mu); // see close_conn
             int fd = accept(lfd, nullptr, nullptr); // non-blocking
-            if (fd >= 0 && conns.size() >= kMaxConns) {
+            if (fd >= 0 && conns.size() >= g_max_conns.load()) {
                 close(fd);
             } else if (fd >= 0) {
                 set_cloexec_nonblock(fd);
@@ -683,6 +713,9 @@ std::shared_ptr<Target> register_target(const std::string& title,
     t->arg = arg;
     install_atfork();
     std::lock_guard<std::mutex> lock(g_mu);
+    size_t max = g_max_targets.load();
+    if (max && g_targets->size() >= max)
+        return nullptr;
     (*g_targets)[t->id] = t;
     return t;
 }
@@ -777,12 +810,24 @@ void send(Target& t, const std::string& utf8)
 }
 
 int start_server(const std::string& host, int port, const std::string& token,
-                 std::string *err)
+                 const Settings& settings, std::string *err)
 {
     install_atfork();
     std::lock_guard<std::mutex> lock(g_mu);
     if (g_port > 0)
         return g_port; // reset in fork children, see atfork_child
+    if (g_thread_running) {
+        *err = "the previous server is still stopping";
+        return -1;
+    }
+    g_max_message = settings.max_message;
+    g_max_conns = settings.max_connections;
+    g_send_idle_ms = settings.send_idle_ms;
+    g_send_total_ms = settings.send_total_ms;
+    g_handshake_ms = settings.handshake_ms;
+    g_max_queued = settings.max_queued;
+    g_max_queued_bytes = settings.max_queued_bytes;
+    g_max_targets = settings.max_targets;
     addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -818,22 +863,60 @@ int start_server(const std::string& host, int port, const std::string& token,
     int bound = ntohs(ss.ss_family == AF_INET6
                       ? reinterpret_cast<sockaddr_in6 *>(&ss)->sin6_port
                       : reinterpret_cast<sockaddr_in *>(&ss)->sin_port);
-    pthread_t thr;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    r = pthread_create(&thr, &attr, server_main, reinterpret_cast<void *>(static_cast<intptr_t>(lfd)));
-    pthread_attr_destroy(&attr);
+    int wake[2];
+    if (pipe(wake) < 0) {
+        close(lfd);
+        *err = std::string("pipe: ") + strerror(errno);
+        return -1;
+    }
+    set_cloexec_nonblock(wake[0]);
+    set_cloexec_nonblock(wake[1]);
+    r = pthread_create(&g_thread, nullptr, server_main, new ServerFds{lfd, wake[0]});
     if (r) {
         close(lfd);
+        close(wake[0]);
+        close(wake[1]);
         *err = std::string("pthread_create: ") + strerror(r);
         return -1;
     }
+    g_thread_running = true;
+    g_wake_r = wake[0];
+    g_wake_w = wake[1];
     g_lfd = lfd;
     g_host = host.find(':') != std::string::npos ? "[" + host + "]" : host;
     g_port = bound;
     g_prefix = token.empty() ? std::string() : "/" + token;
     return bound;
+}
+
+bool stop_server()
+{
+    pthread_t thr;
+    int wake_w;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (g_port < 0 || !g_thread_running)
+            return false;
+        g_port = -1; // new connections are refused from here on
+        g_prefix.clear();
+        thr = g_thread;
+        wake_w = g_wake_w;
+        // the server thread closes g_lfd and g_wake_r itself
+        g_lfd = g_wake_r = g_wake_w = -1;
+    }
+    char b = 0;
+    while (write(wake_w, &b, 1) < 0 && errno == EINTR) {}
+    pthread_join(thr, nullptr); // it takes g_mu in close_conn: not held here
+    close(wake_w);
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_thread_running = false;
+    return true;
+}
+
+size_t target_count()
+{
+    std::lock_guard<std::mutex> lock(g_mu);
+    return g_targets->size();
 }
 
 int server_port()

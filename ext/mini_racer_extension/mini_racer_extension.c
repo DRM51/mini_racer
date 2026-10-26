@@ -1089,6 +1089,143 @@ void v8_inspector_wake(Context *c)
 // Ends a pause that runs past |max_pause|. A thread of its own, because
 // the v8 thread's pause loop can't check the clock while it runs a debugger
 // expression (Debugger.evaluateOnCallFrame) that never returns.
+// --- inspector lifecycle events ---
+//
+// A bounded, process-wide record of what happened to inspectable contexts,
+// for a supervisor to audit or react to (MiniRacer::Inspector.events). Any
+// thread appends; one Ruby consumer takes them. Past INSPECTOR_EVENTS
+// unread, the oldest are dropped and counted, so nothing grows unbounded.
+
+#define INSPECTOR_EVENTS 1024
+
+typedef struct InspectorEvent {
+    uint64_t seq;
+    int type;                 // enum InspectorEventType
+    int64_t at_ms;            // monotonic
+    unsigned generation;      // the context's pause generation then
+    char target[64];
+    char reason[32];
+} InspectorEvent;
+
+static pthread_mutex_t ev_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ev_cv = PTHREAD_COND_INITIALIZER;
+static InspectorEvent ev_ring[INSPECTOR_EVENTS];
+static uint64_t ev_next;      // seq of the next event appended
+static uint64_t ev_read;      // seq of the oldest unread event
+static uint64_t ev_dropped;
+static int ev_wakeup;         // the waiting Ruby thread was interrupted
+
+static const char *const inspector_event_names[] = {
+    "created", "destroyed", "attached", "detached", "paused", "resumed", "terminated",
+};
+
+static void ev_atfork_child(void)
+{
+    pthread_mutex_init(&ev_mtx, NULL);
+    pthread_cond_init(&ev_cv, NULL);
+    ev_next = ev_read = ev_dropped = 0;
+    ev_wakeup = 0;
+}
+
+void v8_inspector_event(Context *c, int type, const char *reason)
+{
+    InspectorEvent *e;
+
+    if (!c->inspector || !*c->inspector_target_id)
+        return;
+    pthread_mutex_lock(&ev_mtx);
+    if (ev_next - ev_read == INSPECTOR_EVENTS) {
+        ev_read++; // drop the oldest
+        ev_dropped++;
+    }
+    e = &ev_ring[ev_next % INSPECTOR_EVENTS];
+    e->seq = ev_next++;
+    e->type = type;
+    e->at_ms = monotonic_ms();
+    e->generation = atomic_load(&c->pause_generation);
+    snprintf(e->target, sizeof(e->target), "%s", c->inspector_target_id);
+    snprintf(e->reason, sizeof(e->reason), "%s", reason ? reason : "");
+    pthread_cond_broadcast(&ev_cv);
+    pthread_mutex_unlock(&ev_mtx);
+}
+
+struct ev_wait {
+    int64_t timeout_ms; // < 0: no timeout
+    InspectorEvent *out;
+    int max, n;
+};
+
+static void *ev_wait_nogvl(void *arg)
+{
+    struct ev_wait *w;
+    struct timespec deadline;
+
+    w = arg;
+    if (w->timeout_ms >= 0)
+        deadline = deadline_ms(w->timeout_ms > INT32_MAX ? INT32_MAX : (int)w->timeout_ms);
+    pthread_mutex_lock(&ev_mtx);
+    ev_wakeup = 0;
+    while (ev_read == ev_next && !ev_wakeup && w->timeout_ms != 0) {
+        if (w->timeout_ms < 0)
+            pthread_cond_wait(&ev_cv, &ev_mtx);
+        else if (pthread_cond_timedwait(&ev_cv, &ev_mtx, &deadline) == ETIMEDOUT)
+            break;
+    }
+    while (ev_read < ev_next && w->n < w->max)
+        w->out[w->n++] = ev_ring[ev_read++ % INSPECTOR_EVENTS];
+    pthread_mutex_unlock(&ev_mtx);
+    return NULL;
+}
+
+static void ev_wait_ubf(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&ev_mtx);
+    ev_wakeup = 1;
+    pthread_cond_broadcast(&ev_cv);
+    pthread_mutex_unlock(&ev_mtx);
+}
+
+// [[seq, type name, at_ms, generation, target id, reason], ...] and the
+// count dropped so far; |timeout_ms| < 0 waits until there is one
+static VALUE inspector_events(VALUE self, VALUE timeout_ms, VALUE max)
+{
+    InspectorEvent buf[64];
+    struct ev_wait w;
+    VALUE a, e;
+    int i;
+
+    w.timeout_ms = NUM2LL(timeout_ms);
+    w.max = NUM2INT(max);
+    if (w.max < 1 || w.max > (int)(sizeof(buf)/sizeof(*buf)))
+        rb_raise(rb_eArgError, "bad max");
+    w.out = buf;
+    w.n = 0;
+    rb_thread_call_without_gvl(ev_wait_nogvl, &w, ev_wait_ubf, NULL);
+    a = rb_ary_new_capa(w.n);
+    for (i = 0; i < w.n; i++) {
+        e = rb_ary_new_from_args(6,
+            ULL2NUM(buf[i].seq),
+            rb_str_new_cstr(inspector_event_names[buf[i].type]),
+            LL2NUM(buf[i].at_ms),
+            UINT2NUM(buf[i].generation),
+            rb_str_new_cstr(buf[i].target),
+            rb_str_new_cstr(buf[i].reason));
+        rb_ary_push(a, e);
+    }
+    return a;
+}
+
+static VALUE inspector_events_dropped(VALUE self)
+{
+    uint64_t n;
+
+    pthread_mutex_lock(&ev_mtx);
+    n = ev_dropped;
+    pthread_mutex_unlock(&ev_mtx);
+    return ULL2NUM(n);
+}
+
 static void *v8_pause_watchdog(void *arg)
 {
     struct timespec deadline;
@@ -1100,6 +1237,7 @@ static void *v8_pause_watchdog(void *arg)
     while (!c->pw.cancel) {
         if (pthread_cond_timedwait(&c->pw.cv, &c->pw.mtx, &deadline) == ETIMEDOUT &&
             !c->pw.cancel) {
+            v8_inspector_event(c, INSPECTOR_EVENT_TERMINATED, "max_pause");
             v8_terminate_execution(c->pst);
             break;
         }
@@ -1115,6 +1253,7 @@ void v8_inspector_paused(Context *c, int paused)
         atomic_store(&c->dbg_pause_start_ms, monotonic_ms());
         atomic_fetch_add(&c->pause_generation, 1);
         atomic_store(&c->dbg_paused, 1);
+        v8_inspector_event(c, INSPECTOR_EVENT_PAUSED, NULL);
         if (c->max_pause > 0 && !c->pw.active) {
             c->pw.cancel = 0;
             c->pw.active = !pthread_create(&c->pw.thr, NULL, v8_pause_watchdog, c);
@@ -1132,12 +1271,14 @@ void v8_inspector_paused(Context *c, int paused)
         // sees "not paused" without the time that pause took
         atomic_fetch_add(&c->dbg_paused_ms, monotonic_ms() - atomic_load(&c->dbg_pause_start_ms));
         atomic_store(&c->dbg_paused, 0);
+        v8_inspector_event(c, INSPECTOR_EVENT_RESUMED, NULL);
     }
 }
 
 void v8_inspector_registered(Context *c, const char *target_id)
 {
     snprintf(c->inspector_target_id, sizeof(c->inspector_target_id), "%s", target_id);
+    v8_inspector_event(c, INSPECTOR_EVENT_CREATED, NULL);
 }
 
 int v8_inspector_detach_terminates(Context *c)
@@ -2100,21 +2241,53 @@ static VALUE context_inspector_break_next(VALUE self)
     return Qnil;
 }
 
-static VALUE inspector_start(VALUE self, VALUE host, VALUE port, VALUE token)
+// |settings| is an Array of 8 non-negative Integers, in v8_inspector_start's
+// order; lib/mini_racer.rb validates their ranges
+static VALUE inspector_start(VALUE self, VALUE host, VALUE port, VALUE token, VALUE settings)
 {
+    int64_t s[8];
     char err[256];
-    int r;
+    int i, r;
 
     StringValue(host);
     StringValue(token);
     Check_Type(port, T_FIXNUM);
     if (FIX2LONG(port) < 0 || FIX2LONG(port) > 65535)
         rb_raise(rb_eArgError, "bad port");
+    Check_Type(settings, T_ARRAY);
+    if (RARRAY_LEN(settings) != 8)
+        rb_raise(rb_eArgError, "bad inspector settings");
+    for (i = 0; i < 8; i++) {
+        s[i] = NUM2LL(rb_ary_entry(settings, i));
+        if (s[i] < 0)
+            rb_raise(rb_eArgError, "bad inspector settings");
+    }
     r = v8_inspector_start(StringValueCStr(host), (int)FIX2LONG(port),
-                           StringValueCStr(token), err, sizeof(err));
+                           StringValueCStr(token), s, err, sizeof(err));
     if (r < 0)
         rb_raise(runtime_error, "inspector: %s", err);
     return INT2FIX(r);
+}
+
+static void *inspector_stop_nogvl(void *arg)
+{
+    (void)arg;
+    return (void *)(intptr_t)v8_inspector_stop();
+}
+
+// waits for the server thread without the GVL: its disconnects reach V8
+// threads that may need a Ruby thread to finish (a Ruby callback)
+static VALUE inspector_stop(VALUE self)
+{
+    void *r;
+
+    r = rb_thread_call_without_gvl(inspector_stop_nogvl, NULL, NULL, NULL);
+    return r ? Qtrue : Qfalse;
+}
+
+static VALUE inspector_target_count(VALUE self)
+{
+    return LONG2NUM(v8_inspector_target_count());
 }
 
 static VALUE inspector_port(VALUE self)
@@ -2548,6 +2721,10 @@ init:
             goto fail;
         barrier_wait(&c->early_init);
         barrier_wait(&c->late_init);
+        if (c->inspector && !*c->inspector_target_id) {
+            context_dispose(self);
+            rb_raise(runtime_error, "inspector: too many targets (Inspector.start's max_targets:)");
+        }
     }
     return Qnil;
 fail:
@@ -2740,7 +2917,12 @@ void Init_mini_racer_extension(void)
     rb_define_alloc_func(c, snapshot_alloc);
 
     c = rb_define_module_under(m, "Inspector");
-    rb_define_private_method(rb_singleton_class(c), "__start", inspector_start, 3);
+    rb_define_private_method(rb_singleton_class(c), "__start", inspector_start, 4);
+    rb_define_private_method(rb_singleton_class(c), "__stop", inspector_stop, 0);
+    rb_define_singleton_method(c, "target_count", inspector_target_count, 0);
+    rb_define_private_method(rb_singleton_class(c), "__events", inspector_events, 2);
+    rb_define_singleton_method(c, "events_dropped", inspector_events_dropped, 0);
+    pthread_atfork(NULL, NULL, ev_atfork_child);
     rb_define_singleton_method(c, "port", inspector_port, 0);
 
     c = rb_define_class_under(m, "Platform", rb_cObject);

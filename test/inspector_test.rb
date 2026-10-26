@@ -5,6 +5,8 @@ require "socket"
 require "securerandom"
 require "uri"
 require "net/http"
+require "open3"
+require "rbconfig"
 
 # Minimal Chrome DevTools Protocol client: just enough WebSocket to talk to
 # MiniRacer::Inspector the way DevTools does.
@@ -256,7 +258,10 @@ class MiniRacerInspectorTest < Minitest::Test
     # caught in JavaScript: no pause
     assert_equal "caught",
                  ctx.eval("try { throw new Error('x') } catch (e) { 'caught' }")
-    th = Thread.new { ctx.eval("(function f() { const row = 7; throw new Error('bad') })()") }
+    th = Thread.new do
+      Thread.current.report_on_exception = false
+      ctx.eval("(function f() { const row = 7; throw new Error('bad') })()")
+    end
     paused = client.wait_event("Debugger.paused")
     assert_equal "exception", paused["reason"]
     frame = paused["callFrames"].first
@@ -524,10 +529,9 @@ class MiniRacerInspectorTest < Minitest::Test
   def test_refuses_non_loopback_host_without_allow_remote
     assert_raises(ArgumentError) { MiniRacer::Inspector.start(host: "0.0.0.0", port: 0) }
     assert_raises(ArgumentError) { MiniRacer::Inspector.start(host: "example.com", port: 0) }
-    # already started, so these return the running server's port
-    assert_equal @port, MiniRacer::Inspector.start(host: "::1", port: 0)
-    assert_equal @port, MiniRacer::Inspector.start(host: "localhost", port: 0)
-    assert_equal @port, MiniRacer::Inspector.start(host: "0.0.0.0", port: 0, allow_remote: true)
+    # already started on 127.0.0.1: another host is refused, not ignored
+    assert_raises(ArgumentError) { MiniRacer::Inspector.start(host: "::1", port: 0) }
+    assert_raises(ArgumentError) { MiniRacer::Inspector.start(host: "0.0.0.0", port: 0, allow_remote: true) }
     assert_equal "http://127.0.0.1:#{@port}/json/list", MiniRacer::Inspector.url
   end
 
@@ -576,6 +580,95 @@ class MiniRacerInspectorTest < Minitest::Test
       sleep 0.01 while ctx.debugger_attached?
     end
     assert_equal 2, ctx.eval("1 + 1")
+  end
+
+  def test_start_refuses_different_settings_and_reports_its_endpoint
+    assert_equal @port, MiniRacer::Inspector.start(port: 0)
+    assert_raises(ArgumentError) { MiniRacer::Inspector.start(port: 0, max_connections: 5) }
+    assert_raises(ArgumentError) { MiniRacer::Inspector.start(port: 0, token: "late") }
+    assert_raises(ArgumentError) { MiniRacer::Inspector.start(port: 0, frobnicate: 1) }
+    endpoint = MiniRacer::Inspector.endpoint
+    assert_equal({ host: "127.0.0.1", port: @port, pid: Process.pid },
+                 endpoint.slice(:host, :port, :pid))
+    assert_match(/\A\h{8}-\h{4}-\h{4}-\h{4}-\h{12}\z/, endpoint[:boot_id])
+  end
+
+  def test_stop_drops_frontends_and_a_restart_lists_the_contexts_again
+    ctx = new_context(inspector: "survives-stop")
+    client = attach_like_devtools("survives-stop")
+    th = Thread.new { ctx.eval("debugger; 'resumed'") }
+    client.wait_event("Debugger.paused")
+    boot_id = MiniRacer::Inspector.endpoint[:boot_id]
+    assert MiniRacer::Inspector.stop
+    refute MiniRacer::Inspector.started?
+    assert_nil MiniRacer::Inspector.endpoint
+    assert client.closed_by_peer?
+    assert_equal "resumed", th.value # inspector_detach: :resume, the default
+    refute MiniRacer::Inspector.stop
+    @port = MiniRacer::Inspector.start(port: 0)
+    refute_equal boot_id, MiniRacer::Inspector.endpoint[:boot_id]
+    assert_includes targets[1].map { |t| t["title"] }, "survives-stop"
+  end
+
+  def test_max_targets_and_handshake_timeout
+    script = <<~RUBY
+      require "mini_racer"
+      require "socket"
+      port = MiniRacer::Inspector.start(port: 0, max_targets: 2, handshake_timeout: 0.2)
+      a = MiniRacer::Context.new(inspector: "a")
+      b = MiniRacer::Context.new(inspector: "b")
+      checks = []
+      checks << (MiniRacer::Inspector.target_count == 2)
+      begin
+        MiniRacer::Context.new(inspector: "c")
+        checks << false
+      rescue MiniRacer::RuntimeError => e
+        checks << e.message.include?("too many targets")
+      end
+      checks << (MiniRacer::Context.new.eval("1 + 1") == 2) # not inspectable: not counted
+      a.dispose
+      c = MiniRacer::Context.new(inspector: "c")
+      checks << (c.eval("2 + 2") == 4)
+      # a connection that never sends its request is dropped
+      sock = TCPSocket.new("127.0.0.1", port)
+      t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      checks << (sock.wait_readable(5) && sock.read_nonblock(1, exception: false).nil?)
+      checks << (Process.clock_gettime(Process::CLOCK_MONOTONIC) - t < 3)
+      puts checks.inspect
+      exit!(checks.all? ? 0 : 1)
+    RUBY
+    out, err, status =
+      Open3.capture3(RbConfig.ruby, "-I", File.expand_path("../lib", __dir__), "-e", script)
+    assert status.success?, "#{out} #{err}"
+  end
+
+  def test_events_follow_a_debugging_session
+    MiniRacer::Inspector.events(max: 64) while MiniRacer::Inspector.events(max: 64).any?
+    ctx = new_context(inspector: "events", inspector_detach: :terminate)
+    id = ctx.inspector_target_id
+    client = attach_like_devtools("events")
+    th = Thread.new do
+      Thread.current.report_on_exception = false
+      ctx.eval("debugger; debugger; 1")
+    end
+    client.wait_event("Debugger.paused")
+    client.command("Debugger.resume")
+    client.wait_event("Debugger.paused")
+    client.close
+    assert_raises(MiniRacer::ScriptTerminatedError) { th.value }
+    ctx.dispose
+    seen = []
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+    until seen.any? { |e| e[:event] == :destroyed } ||
+            Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+      seen.concat(MiniRacer::Inspector.events(timeout: 0.5).select { |e| e[:target_id] == id })
+    end
+    assert_equal %i[created attached paused resumed paused detached terminated resumed destroyed],
+                 seen.map { |e| e[:event] }
+    assert_equal [1, 2], seen.select { |e| e[:event] == :paused }.map { |e| e[:pause_generation] }
+    assert_equal :detach, seen.find { |e| e[:event] == :terminated }[:reason]
+    assert_equal seen.map { |e| e[:seq] }.sort, seen.map { |e| e[:seq] }
+    assert_kind_of Float, seen.first[:at]
   end
 
   def test_fork_child_starts_without_parent_targets
