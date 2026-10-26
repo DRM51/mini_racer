@@ -1,4 +1,4 @@
-- DRM51 builds of 0.22.2 on V8 13.6, 0.22.2.1 to 0.22.2.16 - 25-10-2026 to 26-10-2026
+- DRM51 builds of 0.22.2 on V8 13.6, 0.22.2.1 to 0.22.2.17 - 25-10-2026 to 26-10-2026
   The fourth version segment numbers our builds; upstream doesn't use it. Builds are published at https://drm51.github.io/gems, which lists only the ones in use; every build stays on GitHub as a signed tag and release.
 
   What the DRM51 build adds to upstream 0.22.2 and its unreleased fixes:
@@ -20,7 +20,8 @@
   - From upstream issues: multiline error messages kept apart from backtraces (#262), Ruby `Date` values converted to JavaScript `Date` (#136), `Context#load` returns nil without invoking getters (#197)
 
   Builds:
-  - 0.22.2.16: Codex's review of 0.22.2.15 (debugger handover during a pause, closed connections no longer kept in memory, plain-identifier probes, close codes 1012-1014, the decimal exponent bound); tested on Debian trixie, as integration_tool deploys. The version integration_tool pins
+  - 0.22.2.17: Codex's reviews of 0.22.2.16 and after, all in the debugger (off unless asked for): a frontend's command while idle runs under the context's timeout, one per watchdog, and a queued eval goes before more of them; a new frontend can't take over a departed one's paused command; a second breakpoint in that command doesn't lock the next frontend out; commands left queued when a pause ends run as the script resumes; the pause loop checks its limits between batches; capture expressions probe only plain identifiers. The version integration_tool pins
+  - 0.22.2.16: Codex's review of 0.22.2.15 (debugger handover during a pause, closed connections no longer kept in memory, plain-identifier probes, close codes 1012-1014, the decimal exponent bound); tested on Debian trixie, as integration_tool deploys
   - 0.22.2.15: Codex's review of 0.22.2.14 (debugger session isolation, attach errors held to the value limit, stricter parsing)
   - 0.22.2.14: `decimal: :string`, far years, `MiniRacer::CONVERSIONS`; inspector transport hardening
   - 0.22.2.13: capture expressions
