@@ -180,7 +180,16 @@ class MiniRacerInspectorTest < Minitest::Test
   def test_disposed_context_is_unlisted
     ctx = new_context(inspector: "short-lived")
     ctx.dispose
-    refute_includes targets[1].map { |t| t["title"] }, "short-lived"
+    # dispose wakes the V8 thread, which unregisters the target on its way out
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+    titles = nil
+    loop do
+      titles = targets[1].map { |t| t["title"] }
+      break unless titles.include?("short-lived")
+      break if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+      sleep 0.01
+    end
+    refute_includes titles, "short-lived"
   end
 
   def test_version_endpoint
