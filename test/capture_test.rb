@@ -775,6 +775,51 @@ class MiniRacerCaptureTest < Minitest::Test
     assert status.success?, err
   end
 
+  def test_a_binding_not_yet_declared_says_so_rather_than_showing_a_stale_value
+    ctx = new_context(capture_on_throw: true)
+    # V8 drops the TDZ check here, so in the second iteration the debugger
+    # still sees the first one's tags: the throw is inside tags' own
+    # initializer, so it isn't declared yet
+    capture = capture_of do
+      ctx.eval(<<~JS)
+        let rows = [{ id: 1, details: { tags: ["rail"] } }, { id: 2 }];
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i];
+          const tags = row.details.tags;
+        }
+      JS
+    end
+    block = capture["frames"].first["scopes"].first["variables"]
+    assert_equal "[Not yet declared]", block["tags"]
+    assert_equal({ "id" => 2 }, block["row"])
+  end
+
+  def test_declarations_after_the_throw_are_not_yet_declared_and_earlier_ones_keep_their_values
+    ctx = new_context(capture_on_throw: true)
+    capture = capture_of do
+      ctx.eval(<<~JS)
+        function f(p) {
+          var v = 2
+          let x = 1
+          const { id, name: label } = { id: 7, name: "seven" }
+          null.boom
+          let later = 3
+          const { lateKey } = {}
+          class Later {}
+          return [later, lateKey, Later]
+        }
+        f(9)
+      JS
+    end
+    local = variables(capture["frames"].first)
+    assert_equal [9, 2, 1, 7, "seven"], local.values_at("p", "v", "x", "id", "label")
+    # V8 holds these as holes, which the walker leaves out; either way they
+    # never show a value
+    local.values_at("later", "lateKey", "Later").each do |value|
+      assert_includes [nil, "[Not yet declared]"], value
+    end
+  end
+
   def test_uncaught_exceptions_are_not_printed
     script = <<~RUBY
       require "mini_racer"
