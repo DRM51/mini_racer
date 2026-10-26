@@ -60,15 +60,42 @@ class CdpClient
     @sock.close unless @sock.closed?
   end
 
+  # reads (and discards) whatever is still in flight until the server
+  # closes the connection, or |timeout| passes
   def closed_by_peer?(timeout: 5)
-    return false unless @sock.wait_readable(timeout)
-    @sock.read_nonblock(65_536, exception: false).nil?
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    loop do
+      left = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      return false if left <= 0 || !@sock.wait_readable(left)
+      return true if @sock.read_nonblock(65_536, exception: false).nil?
+    end
   rescue Errno::ECONNRESET
     true
   end
 
   def send_text(text)
     send_frame(0x1, text)
+  end
+
+  # a frame with |b0| as its first byte (FIN, RSV and opcode bits), masked
+  def send_frame_bits(b0, payload)
+    payload = payload.b
+    mask = SecureRandom.random_bytes(4).bytes
+    n = payload.bytesize
+    header = [b0].pack("C") + (n < 126 ? [0x80 | n].pack("C") : [0x80 | 126, n].pack("Cn"))
+    masked = payload.bytes.each_with_index.map { |b, i| b ^ mask[i % 4] }
+    @sock.write(header + mask.pack("C*") + masked.pack("C*"))
+  end
+
+  def wait_response(id, timeout: 5)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    loop do
+      left = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      raise "timed out waiting for response #{id}" if left <= 0
+      msg = read_message(left)
+      return msg["result"] if msg && msg["id"] == id
+      @events << msg if msg
+    end
   end
 
   def send_frame(opcode, payload)
@@ -671,6 +698,135 @@ class MiniRacerInspectorTest < Minitest::Test
     assert_equal :detach, seen.find { |e| e[:event] == :terminated }[:reason]
     assert_equal seen.map { |e| e[:seq] }.sort, seen.map { |e| e[:seq] }
     assert_kind_of Float, seen.first[:at]
+  end
+
+  def test_ambiguous_requests_are_refused
+    t = new_context(inspector: "strict") && target_for("strict")["id"]
+    host = "Host: 127.0.0.1:#{@port}\r\n"
+    # a second Host, a name with a space, a folded line, HTTP/0.9-ish
+    assert_includes raw_request("GET /json/list HTTP/1.1\r\n#{host}Host: evil.example\r\n\r\n"), " 400 "
+    assert_includes raw_request("GET /json/list HTTP/1.1\r\nHost : 127.0.0.1\r\n\r\n"), " 400 "
+    assert_includes raw_request("GET /json/list HTTP/1.1\r\n#{host}X-A: 1\r\n folded\r\n\r\n"), " 400 "
+    assert_includes raw_request("GET /json/list HTTP/2.0\r\n#{host}\r\n"), " 400 "
+    assert_includes raw_request("GET /json/list HTTP/1.1\r\n#{host}\r\n"), " 200 "
+    # Connection must contain the token "upgrade", the key must be 16 bytes of base64
+    head = upgrade_head("/#{t}")
+    assert_includes raw_request(head.sub("Connection: Upgrade", "Connection: notupgrade")), " 400 "
+    assert_includes raw_request(head.sub("Connection: Upgrade", "Connection: keep-alive, Upgrade")), " 101 "
+    bad_key = head.sub(/Sec-WebSocket-Key: \S+/, "Sec-WebSocket-Key: #{"!" * 22}==")
+    assert_includes raw_request(bad_key), " 400 "
+    assert_includes raw_request(head.sub("HTTP/1.1", "HTTP/1.0")), " 400 "
+  end
+
+  def test_malformed_frames_close_the_connection
+    new_context(inspector: "frames")
+    [
+      ->(c) { c.send_frame_bits(0xC1, "{}") },         # RSV1 set
+      ->(c) { c.send_frame_bits(0x80, "{}") },         # continuation of nothing
+      ->(c) { c.send_frame_bits(0x01, "{\"id\":1,"); c.send_frame_bits(0x81, "{}") }, # new message mid-fragment
+      ->(c) { c.send_frame(0x1, "\xff\xfe".b) }        # not UTF-8
+    ].each do |send_bad|
+      client = connect("frames")
+      send_bad.(client)
+      assert client.closed_by_peer?
+      @clients.delete(client)
+    end
+    # a correctly fragmented message is fine
+    client = connect("frames")
+    msg = JSON.generate(id: 1, method: "Runtime.evaluate", params: { expression: "6 * 7" })
+    client.send_frame_bits(0x01, msg[0, 10])
+    client.send_frame_bits(0x80, msg[10..])
+    assert_equal 42, client.wait_response(1)["result"]["value"]
+  end
+
+  def test_a_stalled_partial_frame_is_dropped
+    script = <<~RUBY
+      require "mini_racer"
+      require "socket"
+      require "securerandom"
+      port = MiniRacer::Inspector.start(port: 0, handshake_timeout: 0.3)
+      ctx = MiniRacer::Context.new(inspector: "stall")
+      id = ctx.inspector_target_id
+      sock = TCPSocket.new("127.0.0.1", port)
+      sock.write("GET /\#{id} HTTP/1.1\\r\\nHost: 127.0.0.1:\#{port}\\r\\nUpgrade: websocket\\r\\n" \\
+                 "Connection: Upgrade\\r\\nSec-WebSocket-Key: \#{SecureRandom.base64(16)}\\r\\n" \\
+                 "Sec-WebSocket-Version: 13\\r\\n\\r\\n")
+      nil while sock.gets != "\\r\\n"
+      sock.write([0x81, 0x80 | 100].pack("CC") + "mask" + "x" * 10) # 10 of 100 bytes
+      t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      closed = sock.wait_readable(5) && sock.read_nonblock(1, exception: false).nil?
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t
+      exit!(closed && elapsed < 3 ? 0 : 1)
+    RUBY
+    _, err, status =
+      Open3.capture3(RbConfig.ruby, "-I", File.expand_path("../lib", __dir__), "-e", script)
+    assert status.success?, err
+  end
+
+  def test_a_frontend_that_stops_reading_cannot_stall_the_script
+    script = <<~RUBY
+      require "mini_racer"
+      require "socket"
+      require "securerandom"
+      require "json"
+      port = MiniRacer::Inspector.start(port: 0, max_queued_bytes: 1 << 20, send_idle_timeout: 1)
+      ctx = MiniRacer::Context.new(inspector: "slow")
+      id = ctx.inspector_target_id
+      sock = TCPSocket.new("127.0.0.1", port)
+      sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_RCVBUF, 4096)
+      sock.write("GET /\#{id} HTTP/1.1\\r\\nHost: 127.0.0.1:\#{port}\\r\\nUpgrade: websocket\\r\\n" \\
+                 "Connection: Upgrade\\r\\nSec-WebSocket-Key: \#{SecureRandom.base64(16)}\\r\\n" \\
+                 "Sec-WebSocket-Version: 13\\r\\n\\r\\n")
+      nil while sock.gets != "\\r\\n"
+      msg = JSON.generate(id: 1, method: "Runtime.enable")
+      sock.write([0x81, 0x80 | msg.bytesize].pack("CC") + "\\0\\0\\0\\0" + msg)
+      sleep 0.2 # then never read again
+      t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      n = ctx.eval("for (let i = 0; i < 20000; i++) console.log('x'.repeat(500)); 20000")
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t
+      sleep 0.5
+      exit!(n == 20000 && elapsed < 5 && !ctx.debugger_attached? ? 0 : 1)
+    RUBY
+    _, err, status =
+      Open3.capture3(RbConfig.ruby, "-I", File.expand_path("../lib", __dir__), "-e", script)
+    assert status.success?, err
+  end
+
+  def test_the_next_frontend_does_not_see_the_last_ones_console
+    ctx = new_context(inspector: "console-discard")
+    first = attach_like_devtools("console-discard")
+    ctx.eval("console.log('session one secret')")
+    first.wait_event("Runtime.consoleAPICalled")
+    first.close
+    @clients.delete(first)
+    sleep 0.01 while ctx.debugger_attached?
+    second = connect("console-discard")
+    second.command("Runtime.enable")
+    ctx.eval("console.log('session two')")
+    seen = second.wait_event("Runtime.consoleAPICalled")
+    assert_equal "session two", seen["args"][0]["value"]
+  end
+
+  def test_stop_during_a_blocked_callback_and_a_pause
+    ctx = new_context(inspector: "stop-under-load")
+    ctx.attach("slowRuby", -> { sleep 1; 7 })
+    client = attach_like_devtools("stop-under-load")
+    th = Thread.new { ctx.eval("slowRuby() + 1") }
+    sleep 0.2 # inside the Ruby callback
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    assert MiniRacer::Inspector.stop
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 3
+    assert_equal 8, th.value
+    assert client.closed_by_peer?
+    @clients.delete(client)
+    # and while paused: the default detach policy resumes
+    @port = MiniRacer::Inspector.start(port: 0)
+    client = attach_like_devtools("stop-under-load")
+    th = Thread.new { ctx.eval("debugger; 'resumed'") }
+    client.wait_event("Debugger.paused")
+    assert MiniRacer::Inspector.stop
+    assert_equal "resumed", th.value
+    @port = MiniRacer::Inspector.start(port: 0)
   end
 
   def test_fork_child_starts_without_parent_targets
