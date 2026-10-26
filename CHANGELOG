@@ -1,3 +1,7 @@
+- 0.22.2.13 - 26-10-2026
+  - DRM51 build: 0.22.2.12 plus the change below
+  - `capture_on_throw: {expressions: [...]}`, from drm51_mini_racer 14.6.202.34.2: up to 20 JavaScript expressions evaluated in the failing frame (or the next one out where their names are defined), in V8's side-effect-free mode with a 50 ms limit each; results in `capture["expressions"]`
+
 - 0.22.2.12 - 26-10-2026
   - DRM51 build: 0.22.2.11 plus the change below
   - Each value passed between Ruby and JavaScript is limited to the context's `max_memory` (1 GiB without one, and never more), or to `Context.new(max_value_size: bytes)`; the error names the limit in force, e.g. "serialized value too large (over 512 MB)"
