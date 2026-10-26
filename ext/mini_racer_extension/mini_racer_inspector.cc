@@ -709,6 +709,34 @@ void unregister_target(const std::shared_ptr<Target>& t)
     }
 }
 
+const std::string& target_id(const Target& t)
+{
+    return t.id;
+}
+
+bool disconnect(const std::string& id)
+{
+    std::shared_ptr<Target> t;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        auto it = g_targets->find(id);
+        if (it == g_targets->end())
+            return false;
+        t = it->second;
+    }
+    std::shared_ptr<Conn> conn;
+    {
+        std::lock_guard<std::mutex> lock(t->mu);
+        conn = t->conn;
+    }
+    if (conn) {
+        std::lock_guard<std::mutex> lock(conn->wmu);
+        if (!conn->closed)
+            shutdown(conn->fd, SHUT_RDWR); // the server thread closes it
+    }
+    return true;
+}
+
 Event poll(Target& t, std::string *msg)
 {
     std::lock_guard<std::mutex> lock(t.mu);

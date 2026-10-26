@@ -21,6 +21,11 @@ std::shared_ptr<Target> register_target(const std::string& title,
                                         void (*wake)(void *arg), void *arg);
 // Closes the frontend connection, if any, and stops further wake calls.
 void unregister_target(const std::shared_ptr<Target>& t);
+// The id in /json/list and the WebSocket URL; fixed for the target's life.
+const std::string& target_id(const Target& t);
+// Drops the frontend attached to target |id|, if any; any thread. The
+// target sees Event::Disconnect as usual. False if there's no such target.
+bool disconnect(const std::string& id);
 
 // Pops the next frontend event; *msg is set for Event::Message.
 Event poll(Target& t, std::string *msg);

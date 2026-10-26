@@ -177,7 +177,11 @@ typedef struct Context
     atomic_int dbg_paused;       // v8 thread is stopped at a breakpoint
     atomic_llong dbg_paused_ms;  // total time spent paused; the watchdog
                                  // does not count it against |timeout|
-    int64_t dbg_pause_start_ms;  // v8 thread only
+    atomic_llong dbg_pause_start_ms; // written by the v8 thread
+    atomic_uint pause_generation; // pauses so far; a frame handle is only good
+                                  // for the pause it came from
+    char inspector_target_id[64]; // set by the v8 thread before late_init
+    int inspector_detach_terminates; // Context.new(inspector_detach: :terminate)
 } Context;
 
 typedef struct Snapshot {
@@ -1108,7 +1112,8 @@ static void *v8_pause_watchdog(void *arg)
 void v8_inspector_paused(Context *c, int paused)
 {
     if (paused) {
-        c->dbg_pause_start_ms = monotonic_ms();
+        atomic_store(&c->dbg_pause_start_ms, monotonic_ms());
+        atomic_fetch_add(&c->pause_generation, 1);
         atomic_store(&c->dbg_paused, 1);
         if (c->max_pause > 0 && !c->pw.active) {
             c->pw.cancel = 0;
@@ -1125,9 +1130,19 @@ void v8_inspector_paused(Context *c, int paused)
         }
         // publish the total before clearing the flag so the watchdog never
         // sees "not paused" without the time that pause took
-        atomic_fetch_add(&c->dbg_paused_ms, monotonic_ms() - c->dbg_pause_start_ms);
+        atomic_fetch_add(&c->dbg_paused_ms, monotonic_ms() - atomic_load(&c->dbg_pause_start_ms));
         atomic_store(&c->dbg_paused, 0);
     }
+}
+
+void v8_inspector_registered(Context *c, const char *target_id)
+{
+    snprintf(c->inspector_target_id, sizeof(c->inspector_target_id), "%s", target_id);
+}
+
+int v8_inspector_detach_terminates(Context *c)
+{
+    return c->inspector_detach_terminates;
 }
 
 int64_t v8_inspector_max_pause(Context *c)
@@ -2031,6 +2046,48 @@ static VALUE context_inspector_status(VALUE self)
     return INT2FIX(v8_inspector_status(c->pst));
 }
 
+// [status bits, pause generation, total ms paused, ms into the current pause]
+static VALUE context_inspector_state(VALUE self)
+{
+    long long start, now;
+    Context *c;
+    int paused;
+
+    TypedData_Get_Struct(self, Context, &context_type, c);
+    if (atomic_load(&c->quit))
+        rb_raise(context_disposed_error, "disposed context");
+    if (!c->inspector || !c->pst)
+        return Qnil;
+    paused = atomic_load(&c->dbg_paused);
+    start = atomic_load(&c->dbg_pause_start_ms);
+    now = monotonic_ms();
+    return rb_ary_new_from_args(4,
+        INT2FIX(v8_inspector_status(c->pst) | (paused ? INSPECTOR_PAUSED : 0)),
+        UINT2NUM(atomic_load(&c->pause_generation)),
+        LL2NUM(atomic_load(&c->dbg_paused_ms)),
+        LL2NUM(paused && now > start ? now - start : 0));
+}
+
+static VALUE context_inspector_target_id(VALUE self)
+{
+    Context *c;
+
+    TypedData_Get_Struct(self, Context, &context_type, c);
+    if (atomic_load(&c->quit) || !c->inspector || !*c->inspector_target_id)
+        return Qnil;
+    return rb_str_new_cstr(c->inspector_target_id);
+}
+
+static VALUE context_inspector_disconnect(VALUE self)
+{
+    Context *c;
+
+    TypedData_Get_Struct(self, Context, &context_type, c);
+    if (!c->inspector || !*c->inspector_target_id)
+        return Qfalse;
+    return v8_inspector_disconnect(c->inspector_target_id) ? Qtrue : Qfalse;
+}
+
 static VALUE context_inspector_break_next(VALUE self)
 {
     Context *c;
@@ -2455,6 +2512,13 @@ static VALUE context_initialize(int argc, VALUE *argv, VALUE self)
                 rb_raise(rb_eArgError, "inspector is not supported in single_threaded mode");
             c->inspector = 1;
             set_inspector_title(c, v == Qtrue ? rb_str_new_cstr("mini_racer") : v);
+        } else if (!strcmp(s, "inspector_detach")) {
+            if (v == ID2SYM(rb_intern("terminate")))
+                c->inspector_detach_terminates = 1;
+            else if (v == ID2SYM(rb_intern("resume")) || NIL_P(v))
+                c->inspector_detach_terminates = 0;
+            else
+                rb_raise(rb_eArgError, "bad inspector_detach: expected :resume or :terminate");
         } else if (!strcmp(s, "capture_on_throw")) {
             c->capture_on_throw = !(v == Qfalse || v == Qnil);
             if (c->capture_on_throw && single_threaded)
@@ -2662,6 +2726,9 @@ void Init_mini_racer_extension(void)
     rb_define_method(c, "low_memory_notification", context_low_memory_notification, 0);
     rb_define_private_method(c, "__inspector_status", context_inspector_status, 0);
     rb_define_private_method(c, "__inspector_break_next", context_inspector_break_next, 0);
+    rb_define_private_method(c, "__inspector_state", context_inspector_state, 0);
+    rb_define_private_method(c, "__inspector_disconnect", context_inspector_disconnect, 0);
+    rb_define_method(c, "inspector_target_id", context_inspector_target_id, 0);
     rb_define_alloc_func(c, context_alloc);
 
     c = snapshot_class = rb_define_class_under(m, "Snapshot", rb_cObject);

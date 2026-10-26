@@ -35,6 +35,8 @@ void v8_inspector_wake(struct Context *c); // any thread; wakes an idle v8 threa
 void v8_inspector_paused(struct Context *c, int paused); // v8 thread
 int v8_context_quitting(struct Context *c);
 int64_t v8_inspector_max_pause(struct Context *c); // ms, 0 = unlimited
+void v8_inspector_registered(struct Context *c, const char *target_id); // v8 thread, during init
+int v8_inspector_detach_terminates(struct Context *c); // Context.new(inspector_detach: :terminate)
 
 // defined in mini_racer_v8.cc
 void v8_global_init(void);
@@ -71,11 +73,13 @@ enum
     INSPECTOR_ENABLED  = 1,
     INSPECTOR_ATTACHED = 2, // a frontend is connected
     INSPECTOR_READY    = 4, // the frontend sent Runtime.runIfWaitingForDebugger
+    INSPECTOR_PAUSED   = 8, // stopped at a breakpoint (Context#inspector_state only)
 };
 void v8_inspector_dispatch(struct State *pst); // v8 thread, while idle
 void v8_inspector_shutdown(struct State *pst); // v8 thread, without Context.mtx
 int v8_inspector_status(struct State *pst);
 void v8_inspector_break_next(struct State *pst);
+int v8_inspector_disconnect(const char *target_id); // any thread; 0 if no such target
 int v8_inspector_start(const char *host, int port, const char *token, char *err, size_t errlen);
 int v8_inspector_port(void);
 

@@ -270,6 +270,109 @@ class MiniRacerInspectorTest < Minitest::Test
     assert_raises(MiniRacer::RuntimeError) { ctx.eval("throw new Error('quiet')") }
   end
 
+  def test_target_id_matches_the_listing
+    ctx = new_context(inspector: "by-id")
+    assert_equal target_for("by-id")["id"], ctx.inspector_target_id
+    assert_nil new_context.inspector_target_id
+    ctx.dispose
+    assert_nil ctx.inspector_target_id
+  end
+
+  def test_inspector_state_follows_attach_and_pauses
+    ctx = new_context(inspector: "state")
+    assert_nil new_context.inspector_state
+    state = ctx.inspector_state
+    refute state[:attached]
+    assert_equal 0, state[:pause_generation]
+    client = attach_like_devtools("state")
+    th = Thread.new { ctx.eval("debugger; debugger; 1") }
+    client.wait_event("Debugger.paused")
+    sleep 0.05
+    state = ctx.inspector_state
+    assert state[:attached]
+    assert state[:ready]
+    assert state[:paused]
+    assert_equal 1, state[:pause_generation]
+    assert_operator state[:paused_ms], :>=, 40
+    client.command("Debugger.resume")
+    client.wait_event("Debugger.paused")
+    assert_equal 2, ctx.inspector_state[:pause_generation]
+    client.command("Debugger.resume")
+    assert_equal 1, th.value
+    state = ctx.inspector_state
+    refute state[:paused]
+    assert_equal 0, state[:paused_ms]
+    assert_operator state[:total_paused_ms], :>=, 40
+  end
+
+  def test_await_debugger_says_how_the_wait_ended
+    ctx = new_context(inspector: "await")
+    assert_equal :timeout, ctx.await_debugger(timeout: 0.05)
+    th = Thread.new { ctx.await_debugger }
+    sleep 0.1
+    ctx.cancel_debugger_wait
+    assert_equal :cancelled, th.value
+    th = Thread.new { ctx.await_debugger }
+    sleep 0.1
+    ctx.stop
+    assert_equal :cancelled, th.value
+    th = Thread.new { ctx.await_debugger(timeout: 5) }
+    sleep 0.1
+    attach_like_devtools("await")
+    assert_equal :ready, th.value
+    other = new_context(inspector: "await-disposed")
+    th = Thread.new { other.await_debugger(timeout: 5) }
+    sleep 0.1
+    other.dispose
+    assert_equal :disposed, th.value
+    assert_raises(MiniRacer::ContextDisposedError) { other.wait_for_debugger(timeout: 0) }
+  end
+
+  def test_inspector_detach_terminate_ends_a_paused_script
+    ctx = new_context(inspector: "detach-terminate", inspector_detach: :terminate)
+    client = attach_like_devtools("detach-terminate")
+    th = Thread.new do
+      Thread.current.report_on_exception = false
+      ctx.eval("debugger; 'ran on'")
+    end
+    client.wait_event("Debugger.paused")
+    client.close
+    assert_raises(MiniRacer::ScriptTerminatedError) { th.value }
+    # only what was running then: the context is still usable
+    assert_equal 2, ctx.eval("1 + 1")
+    assert_raises(ArgumentError) { new_context(inspector: "x", inspector_detach: :explode) }
+  end
+
+  def test_detach_resumes_by_default
+    ctx = new_context(inspector: "detach-resume")
+    client = attach_like_devtools("detach-resume")
+    th = Thread.new { ctx.eval("debugger; 'ran on'") }
+    client.wait_event("Debugger.paused")
+    client.close
+    assert_equal "ran on", th.value
+  end
+
+  def test_disconnect_debugger_revokes_and_terminates
+    ctx = new_context(inspector: "revoke")
+    client = attach_like_devtools("revoke")
+    th = Thread.new do
+      Thread.current.report_on_exception = false
+      ctx.eval("debugger; 'ran on'")
+    end
+    client.wait_event("Debugger.paused")
+    assert ctx.disconnect_debugger
+    assert_raises(MiniRacer::ScriptTerminatedError) { th.value }
+    assert client.closed_by_peer?
+    refute ctx.debugger_attached?
+    assert_equal 2, ctx.eval("1 + 1")
+    # without terminate:, the default policy resumes
+    client = attach_like_devtools("revoke")
+    th = Thread.new { ctx.eval("debugger; 'ran on'") }
+    client.wait_event("Debugger.paused")
+    ctx.disconnect_debugger(terminate: false)
+    assert_equal "ran on", th.value
+  end
+
   def test_ruby_callback_from_breakpoint_console
     ctx = new_context(inspector: "paused-callback")
     ctx.attach("rubyAdd", proc { |a, b| a + b })
