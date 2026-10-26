@@ -742,7 +742,8 @@ static int serialize1(Ser *s, VALUE refs, VALUE v, int depth, int opts)
         } else if (opts & SER_DECIMAL_FLOAT) {
             if (NIL_P(big_decimal_class) && rb_const_defined(rb_cObject, rb_intern("BigDecimal")))
                 big_decimal_class = rb_const_get(rb_cObject, rb_intern("BigDecimal"));
-            if (!NIL_P(big_decimal_class) && rb_obj_is_kind_of(v, big_decimal_class)) {
+            // the exact class, like Date above: a subclass's to_f isn't ours to run
+            if (!NIL_P(big_decimal_class) && CLASS_OF(v) == big_decimal_class) {
                 ser_num(s, NUM2DBL(rb_funcall(v, rb_intern("to_f"), 0)));
                 break;
             }
