@@ -1,3 +1,10 @@
+- 0.22.2.9 - 26-10-2026
+  - DRM51 build: 0.22.2.7 plus the changes below
+  - Values passed between Ruby and JavaScript are limited to 1 GiB serialized; larger ones raise `MiniRacer::RuntimeError` ("serialized value too large (over 1 GiB)", or "RangeError: value too large to return to Ruby" from JavaScript)
+  - `max_memory:` now also counts ArrayBuffer and typed array memory; an allocation past the limit throws a catchable `RangeError` ("Array buffer allocation failed"). The README lists what it still doesn't cover (WebAssembly memories, copies between Ruby and JavaScript)
+  - `decimal: :float` converts only BigDecimal itself, not subclasses
+  - capture_on_throw: the 100 ms deadline starts at the pause, at most 20 scopes are recorded per frame, integer keys past 50 aren't enumerated, and only the innermost 10 frames of V8's pause message are parsed (a throw thousands of frames deep now gets a capture)
+
 - 0.22.2.7 - 25-10-2026
   - DRM51 build: 0.22.2.5 plus the change below
   - capture_on_throw: a record attaches only to the error of the eval or call it was made in, and not at all when two records of that evaluation match the thrown value; long Symbol descriptions, function names and error messages are shortened before they are converted; long property names that shorten alike no longer overwrite each other
