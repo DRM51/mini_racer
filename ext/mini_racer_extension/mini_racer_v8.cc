@@ -882,6 +882,7 @@ constexpr int kCaptureMillis = 100;      // time spent recording per exception
 constexpr size_t kCaptureCollection = 10000; // larger Maps and Sets: just the size
 constexpr size_t kCaptureRecords = 8;    // pauses waiting for their error
 constexpr size_t kCapturePauseMessage = 16 << 20; // larger pauses aren't recorded
+constexpr int kCaptureEvalMillis = 50;   // per capture_on_throw expression
 
 struct CaptureClient final : public v8_inspector::V8InspectorClient
 {
@@ -902,7 +903,7 @@ struct CaptureChannel final : public v8_inspector::V8Inspector::Channel
 {
     Capture& cap;
     explicit CaptureChannel(Capture& cap) : cap(cap) {}
-    void sendResponse(int, std::unique_ptr<v8_inspector::StringBuffer>) override {}
+    void sendResponse(int id, std::unique_ptr<v8_inspector::StringBuffer> m) override;
     void sendNotification(std::unique_ptr<v8_inspector::StringBuffer> m) override;
     void flushProtocolNotifications() override {}
 };
@@ -917,6 +918,9 @@ struct Capture
     std::unique_ptr<v8_inspector::V8Inspector> inspector;
     std::unique_ptr<v8_inspector::V8InspectorSession> session;
     std::string paused;         // the Debugger.paused notification being handled
+    std::vector<std::string> expressions; // capture_on_throw: {expressions:}
+    int pending_id = 100;       // our last request; ids below 100 are setup
+    std::string response;       // the response to it
     bool console_dirty = false; // console.* calls V8 kept for the inspector
 
     explicit Capture(State& st) : st(st) {}
@@ -945,6 +949,12 @@ void CaptureChannel::sendNotification(std::unique_ptr<v8_inspector::StringBuffer
     if (v.length() <= kCapturePauseMessage &&
         starts_with(v, "{\"method\":\"Debugger.paused\""))
         cap.paused = to_utf8(v);
+}
+
+void CaptureChannel::sendResponse(int id, std::unique_ptr<v8_inspector::StringBuffer> m)
+{
+    if (id == cap.pending_id)
+        cap.response = to_utf8(m->string());
 }
 
 v8::Local<v8::Context> CaptureClient::ensureDefaultContextInGroup(int)
@@ -990,10 +1000,12 @@ size_t capture_near_heap_limit(void *, size_t current_heap_limit, size_t)
     return current_heap_limit;
 }
 
-void capture_init(State& st)
+void capture_init(State& st, const char *expressions, size_t expressions_len)
 {
     st.capture = std::make_unique<Capture>(st);
     Capture& cap = *st.capture;
+    for (const char *p = expressions, *pe = p + expressions_len; p && p < pe; p += strlen(p) + 1)
+        cap.expressions.emplace_back(p);
     v8::HandleScope handle_scope(st.isolate);
     cap.inspector = v8_inspector::V8Inspector::create(st.isolate, &cap.client);
     v8_inspector::V8ContextInfo info(st.context, kContextGroupId, latin1_view("mini_racer"));
@@ -1396,6 +1408,109 @@ bool thrown_value(Capture& cap, CaptureWalk& walk, v8::Local<v8::Value> data,
     return true;
 }
 
+// Evaluates one capture_on_throw expression in a paused frame, without side
+// effects: V8 refuses anything that would assign, call a non-pure function
+// (an attached Ruby function among them) or run a getter, and stops it after
+// kCaptureEvalMillis. False, with |*error|, when it threw or was refused;
+// |*missing| when a name wasn't defined there, so an outer frame can try.
+bool capture_evaluate(Capture& cap, CaptureWalk& walk, v8::Local<v8::Value> frame,
+                      const std::string& expression, v8::Local<v8::Value> *value,
+                      std::string *error, bool *missing)
+{
+    State& st = cap.st;
+    auto sc = st.safe_context;
+    *missing = false;
+    auto params = walk.new_object();
+    walk.put(params, walk.str("callFrameId"), get_field(sc, frame, "callFrameId"));
+    walk.put(params, walk.str("expression"), walk.str(expression));
+    // released when the pause ends, like the scope objects
+    walk.put(params, walk.str("objectGroup"), walk.str("backtrace"));
+    walk.put(params, walk.str("silent"), v8::True(st.isolate));
+    walk.put(params, walk.str("throwOnSideEffect"), v8::True(st.isolate));
+    walk.put(params, walk.str("timeout"), v8::Number::New(st.isolate, kCaptureEvalMillis));
+    auto request = walk.new_object();
+    walk.put(request, walk.str("id"), v8::Integer::New(st.isolate, ++cap.pending_id));
+    walk.put(request, walk.str("method"), walk.str("Debugger.evaluateOnCallFrame"));
+    walk.put(request, walk.str("params"), params);
+    v8::Local<v8::String> json;
+    v8::Local<v8::Value> parsed;
+    if (!v8::JSON::Stringify(sc, request).ToLocal(&json)) {
+        *error = "[not evaluated]";
+        return false;
+    }
+    std::vector<uint16_t> u16 = utf8_to_utf16(walk.utf8(json));
+    cap.response.clear();
+    cap.session->dispatchProtocolMessage(v8_inspector::StringView(u16.data(), u16.size()));
+    if (cap.response.empty() || !v8::JSON::Parse(sc, walk.str(cap.response)).ToLocal(&parsed)) {
+        *error = "[not evaluated]";
+        return false;
+    }
+    auto failure = get_field(sc, parsed, "error"); // a timeout ends up here
+    if (failure->IsObject()) {
+        auto text = get_field(sc, failure, "message");
+        *error = text->IsString() ? walk.utf8(walk.truncated(text.As<v8::String>())) : "[not evaluated]";
+        return false;
+    }
+    auto result = get_field(sc, parsed, "result");
+    auto details = get_field(sc, result, "exceptionDetails");
+    if (details->IsObject()) {
+        auto exception = get_field(sc, details, "exception");
+        *missing = walk.utf8(get_field(sc, exception, "className")) == "ReferenceError";
+        auto text = get_field(sc, exception, "description");
+        if (!text->IsString()) text = get_field(sc, details, "text");
+        std::string line = walk.utf8(text);
+        line = line.substr(0, line.find('\n')); // the message, not the stack
+        *error = walk.utf8(walk.truncated(walk.str(line)));
+        return false;
+    }
+    v8::Local<v8::Value> v;
+    std::string bigint;
+    if (!thrown_value(cap, walk, get_field(sc, result, "result"), &v, &bigint)) {
+        *error = "[not representable]";
+        return false;
+    }
+    *value = bigint.empty() ? walk.value(v, 0) : walk.str(bigint).As<v8::Value>();
+    return true;
+}
+
+// capture_on_throw: {expressions:}: each is evaluated in the innermost frame
+// first, and in the next one out while its names aren't defined, so
+// "row.id" still works when the throw came from a helper.
+v8::Local<v8::Value> capture_expressions(Capture& cap, CaptureWalk& walk, v8::Local<v8::Array> frames)
+{
+    State& st = cap.st;
+    auto sc = st.safe_context;
+    auto out = walk.new_array();
+    uint32_t k = 0;
+    uint32_t n = std::min(frames->Length(), static_cast<uint32_t>(kCaptureFrames));
+    for (auto& expression : cap.expressions) {
+        auto entry = walk.new_object();
+        walk.put(entry, walk.str("expression"), walk.truncated(walk.str(expression)));
+        std::string error = "[not evaluated]";
+        bool done = false;
+        for (uint32_t i = 0; i < n && !walk.exhausted(); i++) {
+            v8::Local<v8::Value> frame, value;
+            std::string e;
+            bool missing = false;
+            if (!frames->Get(sc, i).ToLocal(&frame)) break;
+            if (capture_evaluate(cap, walk, frame, expression, &value, &e, &missing)) {
+                walk.put(entry, walk.str("frame"), v8::Integer::NewFromUnsigned(st.isolate, i));
+                walk.put(entry, walk.str("value"), value);
+                done = true;
+                break;
+            }
+            if (i == 0 || !missing) error = e; // all frames missing: the innermost's error
+            if (!missing) {
+                walk.put(entry, walk.str("frame"), v8::Integer::NewFromUnsigned(st.isolate, i));
+                break;
+            }
+        }
+        if (!done) walk.put(entry, walk.str("error"), walk.str(error));
+        walk.put(out, k++, entry);
+    }
+    return out;
+}
+
 void capture_record(Capture& cap, const std::string& message)
 {
     State& st = cap.st;
@@ -1486,6 +1601,8 @@ void capture_record(Capture& cap, const std::string& message)
     auto record = walk.new_object();
     walk.put(record, walk.str("reason"), get_field(sc, params, "reason"));
     walk.put(record, walk.str("frames"), out_frames);
+    if (!cap.expressions.empty())
+        walk.put(record, walk.str("expressions"), capture_expressions(cap, walk, frames));
     // a single large value can carry recording past the deadline
     if (walk.stopped || std::chrono::steady_clock::now() > walk.deadline)
         walk.put(record, walk.str("truncated"), v8::True(st.isolate));
@@ -1575,7 +1692,9 @@ extern "C" State *v8_thread_init(Context *c, const uint8_t *snapshot_buf,
                                  size_t snapshot_len, int64_t max_memory,
                                  int verbose_exceptions,
                                  const char *inspector_title,
-                                 int capture_on_throw)
+                                 int capture_on_throw,
+                                 const char *capture_expressions_buf,
+                                 size_t capture_expressions_len)
 {
     State *pst = new State{};
     State& st = *pst;
@@ -1631,7 +1750,7 @@ extern "C" State *v8_thread_init(Context *c, const uint8_t *snapshot_buf,
         if (inspector_title)
             inspector_init(st, inspector_title);
         if (capture_on_throw) {
-            capture_init(st);
+            capture_init(st, capture_expressions_buf, capture_expressions_len);
             if (!st.verbose_exceptions)
                 st.isolate->AddMessageListener(capture_message_listener);
         }

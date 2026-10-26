@@ -304,6 +304,21 @@ end
   V8 calls `toString` on a thrown object that isn't an `Error`. V8's debugger
   reads the exception's `name`, `message` and `stack`, so getters defined for
   those run once more than without the option.
+- `capture_on_throw: {expressions: ["row.id", "items.length"]}` also evaluates
+  up to 20 JavaScript expressions at the moment of failure, in the innermost
+  frame first and in the next one out while a name isn't defined there:
+
+  ```ruby
+  e.capture["expressions"]
+  # => [{"expression" => "row.id", "frame" => 1, "value" => 7},
+  #     {"expression" => "row.id = 9", "frame" => 1,
+  #      "error" => "EvalError: Possible side-effect in debug-evaluate"}]
+  ```
+
+  They run in V8's side-effect-free mode: anything that would assign,
+  mutate, run a getter or call a non-pure function (an attached Ruby function
+  among them) is refused, and each is stopped after 50 ms. Values are copied
+  like variables. The expressions share the capture's limits.
 - An exception counts as uncaught relative to the innermost `eval` or `call`:
   one thrown inside a `try` in an outer script, around the Ruby callback that
   made the nested `eval`, isn't recorded. The `script` scope (top-level

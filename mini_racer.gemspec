@@ -12,8 +12,8 @@ Gem::Specification.new do |spec|
   spec.summary = "DRM51 build of mini_racer: embedded V8 for Ruby"
   spec.description =
     "DRM51's fork of mini_racer (based on mini_racer 0.22.2), on V8 " \
-    "#{MiniRacer::VERSION.split(".").first(4).join(".")}. Not an upstream " \
-    "mini_racer release; versions follow the V8 version."
+      "#{MiniRacer::VERSION.split(".").first(4).join(".")}. Not an upstream " \
+      "mini_racer release; versions follow the V8 version."
   spec.homepage = "https://github.com/DRM51/mini_racer"
   spec.license = "MIT"
 

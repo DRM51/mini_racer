@@ -20,6 +20,12 @@ class MiniRacerCaptureTest < Minitest::Test
     ctx
   end
 
+  def new_context_with(**capture_opts)
+    ctx = MiniRacer::Context.new(capture_on_throw: capture_opts)
+    @contexts << ctx
+    ctx
+  end
+
   def capture_of
     yield
     flunk "expected a MiniRacer::RuntimeError"
@@ -435,6 +441,93 @@ class MiniRacerCaptureTest < Minitest::Test
           })()
         JS
     assert_equal [1, 2], variables(capture["frames"].first)["o"].values.sort
+  end
+
+  def test_expressions_are_evaluated_in_the_failing_frame
+    ctx =
+      new_context_with(
+        expressions: [
+          "row.id",
+          "row.items.map(i => i.qty).reduce((a, b) => a + b, 0)",
+          "label",
+          "nowhere.x"
+        ]
+      )
+    ctx.eval(<<~JS)
+      function helper(c) { return c.name }
+      function transform(row) { const label = "#" + row.id; return helper(row.customer) }
+    JS
+    capture =
+      capture_of do
+        ctx.call(
+          "transform",
+          {
+            "id" => 7,
+            "customer" => nil,
+            "items" => [{ "qty" => 2 }, { "qty" => 3 }]
+          }
+        )
+      end
+    results = capture["expressions"].to_h { |x| [x["expression"], x] }
+    # helper's frame has no row; the next frame out does
+    assert_equal(
+      { "expression" => "row.id", "frame" => 1, "value" => 7 },
+      results["row.id"]
+    )
+    assert_equal 5, results.values[1]["value"]
+    assert_equal "#7", results["label"]["value"]
+    assert_equal "ReferenceError: nowhere is not defined",
+                 results["nowhere.x"]["error"]
+    refute results["nowhere.x"].key?("frame")
+  end
+
+  def test_expressions_cannot_change_anything
+    calls = 0
+    ctx =
+      new_context_with(
+        expressions: [
+          "row.secret",
+          "row.id = 99",
+          "rubyFn()",
+          "row.tags.push(1)",
+          "while (true) {}"
+        ]
+      )
+    ctx.attach("rubyFn", -> { calls += 1 })
+    ctx.eval(<<~JS)
+      globalThis.hits = 0;
+      function fail(row) {
+        Object.defineProperty(row, "secret", { get() { hits++; return 1 } });
+        throw new Error("x");
+      }
+    JS
+    capture = capture_of { ctx.call("fail", { "id" => 1, "tags" => [] }) }
+    errors = capture["expressions"].map { |x| x["error"] }
+    assert_equal 4, errors.grep(/side-effect/).size, errors.inspect
+    assert_equal "Execution was terminated", errors.last
+    assert_equal 0, ctx.eval("hits")
+    assert_equal 0, calls
+    assert_equal 2, ctx.eval("1 + 1")
+  end
+
+  def test_expression_options_are_checked
+    [
+      { expressions: "row.id" },
+      { expressions: [1] },
+      { expressions: [""] },
+      { expressions: ["x" * 1001] },
+      { expressions: ["a"] * 21 },
+      { other: true }
+    ].each do |opts|
+      assert_raises(ArgumentError, opts.inspect) do
+        MiniRacer::Context.new(capture_on_throw: opts)
+      end
+    end
+    ctx = MiniRacer::Context.new(capture_on_throw: {})
+    @contexts << ctx
+    capture = capture_of { ctx.eval("(function f() { let a = 1; null.x })()") }
+    assert_equal({ "a" => 1 }, variables(capture["frames"].first))
+    refute capture.key?("expressions")
   end
 
   def test_cannot_be_combined_with_the_inspector
