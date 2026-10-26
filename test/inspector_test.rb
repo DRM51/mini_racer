@@ -73,8 +73,24 @@ class CdpClient
     true
   end
 
+  attr_reader :events
+
   def send_text(text)
     send_frame(0x1, text)
+  end
+
+  # the next frame of any kind, as [opcode, payload]
+  def read_frame(timeout = 5)
+    return nil unless @sock.wait_readable(timeout)
+    b0, b1 = @sock.read(2).bytes
+    len = b1 & 0x7f
+    len = @sock.read(2).unpack1("n") if len == 126
+    len = @sock.read(8).unpack1("Q>") if len == 127
+    [b0 & 0x0f, len.zero? ? "".b : @sock.read(len)]
+  end
+
+  def write_raw(bytes)
+    @sock.write(bytes)
   end
 
   # a frame with |b0| as its first byte (FIN, RSV and opcode bits), masked
@@ -709,6 +725,19 @@ class MiniRacerInspectorTest < Minitest::Test
     assert_includes raw_request("GET /json/list HTTP/1.1\r\n#{host}X-A: 1\r\n folded\r\n\r\n"), " 400 "
     assert_includes raw_request("GET /json/list HTTP/2.0\r\n#{host}\r\n"), " 400 "
     assert_includes raw_request("GET /json/list HTTP/1.1\r\n#{host}\r\n"), " 200 "
+    # control characters in a value; HTTP/1.1 without Host (1.0 may omit it)
+    assert_includes raw_request("GET /json/list HTTP/1.1\r\n#{host}X-A: a\x01b\r\n\r\n"), " 400 "
+    assert_includes raw_request("GET /json/list HTTP/1.1\r\n#{host}X-A: a\x7fb\r\n\r\n"), " 400 "
+    assert_includes raw_request("GET /json/list HTTP/1.1\r\n#{host}X-A: a\tb\r\n\r\n"), " 200 "
+    assert_includes raw_request("GET /json/list HTTP/1.1\r\n\r\n"), " 400 "
+    assert_includes raw_request("GET /json/list HTTP/1.0\r\n\r\n"), " 200 "
+    # a head over 64 KiB is refused even when the read that ends it is short
+    sock = TCPSocket.new("127.0.0.1", @port)
+    sock.write("GET /json/list HTTP/1.1\r\n#{host}X-Big: #{"a" * 60_000}")
+    sleep 0.2
+    sock.write("#{"a" * 6000}\r\n\r\n")
+    refute_includes sock.gets.to_s, " 200 "
+    sock.close
     # Connection must contain the token "upgrade", the key must be 16 bytes of base64
     head = upgrade_head("/#{t}")
     assert_includes raw_request(head.sub("Connection: Upgrade", "Connection: notupgrade")), " 400 "
@@ -721,6 +750,8 @@ class MiniRacerInspectorTest < Minitest::Test
   def test_malformed_frames_close_the_connection
     new_context(inspector: "frames")
     [
+      ->(c) { c.write_raw([0x81, 0x80 | 126, 5].pack("CCn") + "\0\0\0\0{}{}{") }, # 16-bit length for 5 bytes
+      ->(c) { c.write_raw([0x81, 0x80 | 127, 5].pack("CCQ>") + "\0\0\0\0{}{}{") }, # 64-bit length for 5 bytes
       ->(c) { c.send_frame_bits(0xC1, "{}") },         # RSV1 set
       ->(c) { c.send_frame_bits(0x80, "{}") },         # continuation of nothing
       ->(c) { c.send_frame_bits(0x01, "{\"id\":1,"); c.send_frame_bits(0x81, "{}") }, # new message mid-fragment
@@ -737,6 +768,22 @@ class MiniRacerInspectorTest < Minitest::Test
     client.send_frame_bits(0x01, msg[0, 10])
     client.send_frame_bits(0x80, msg[10..])
     assert_equal 42, client.wait_response(1)["result"]["value"]
+  end
+
+  def test_close_frames_are_answered_with_a_valid_code
+    new_context(inspector: "close")
+    { [1000].pack("n") + "bye" => [1000].pack("n"),
+      "" => "",
+      [1001].pack("n") + "\xff".b => [1002].pack("n"), # reason not UTF-8
+      [999].pack("n") => [1002].pack("n"),              # not a code to send
+      [1005].pack("n") => [1002].pack("n"),             # reserved
+      "\x03" => [1002].pack("n") }.each do |sent, answer|                # one byte
+      client = connect("close")
+      client.send_frame(0x8, sent)
+      assert_equal [0x8, answer.b], client.read_frame, sent.inspect
+      assert client.closed_by_peer?
+      @clients.delete(client)
+    end
   end
 
   def test_a_stalled_partial_frame_is_dropped
@@ -757,6 +804,37 @@ class MiniRacerInspectorTest < Minitest::Test
       closed = sock.wait_readable(5) && sock.read_nonblock(1, exception: false).nil?
       elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t
       exit!(closed && elapsed < 3 ? 0 : 1)
+    RUBY
+    _, err, status =
+      Open3.capture3(RbConfig.ruby, "-I", File.expand_path("../lib", __dir__), "-e", script)
+    assert status.success?, err
+  end
+
+  def test_back_to_back_messages_each_get_the_partial_frame_timeout
+    script = <<~RUBY
+      require "mini_racer"
+      require "socket"
+      require "securerandom"
+      port = MiniRacer::Inspector.start(port: 0, handshake_timeout: 0.5)
+      ctx = MiniRacer::Context.new(inspector: "steady")
+      id = ctx.inspector_target_id
+      sock = TCPSocket.new("127.0.0.1", port)
+      sock.write("GET /\#{id} HTTP/1.1\\r\\nHost: 127.0.0.1:\#{port}\\r\\nUpgrade: websocket\\r\\n" \\
+                 "Connection: Upgrade\\r\\nSec-WebSocket-Key: \#{SecureRandom.base64(16)}\\r\\n" \\
+                 "Sec-WebSocket-Version: 13\\r\\n\\r\\n")
+      nil while sock.gets != "\\r\\n"
+      ping = [0x89, 0x80 | 4].pack("CC") + "\\0\\0\\0\\0ping" # masked with zeros
+      # each write ends one ping and starts the next, for 3x handshake_timeout
+      sock.write(ping[0, 3])
+      10.times { sleep 0.15; sock.write(ping[3..] + ping[0, 3]) }
+      sock.write(ping[3..])
+      pongs = 0
+      while sock.wait_readable(1) && (head = sock.read(2))
+        pongs += 1 if head.getbyte(0) == 0x8A
+        sock.read(head.getbyte(1) & 0x7f)
+        break if pongs == 11
+      end
+      exit!(pongs == 11 ? 0 : 1)
     RUBY
     _, err, status =
       Open3.capture3(RbConfig.ruby, "-I", File.expand_path("../lib", __dir__), "-e", script)
@@ -805,6 +883,33 @@ class MiniRacerInspectorTest < Minitest::Test
     ctx.eval("console.log('session two')")
     seen = second.wait_event("Runtime.consoleAPICalled")
     assert_equal "session two", seen["args"][0]["value"]
+  end
+
+  def test_a_quick_reconnect_sees_nothing_of_the_last_frontends_queued_commands
+    ctx = new_context(inspector: "quick-reconnect")
+    ctx.attach("nap", -> { sleep 1; 1 })
+    ctx.eval("console.log('left by session one')")
+    first = connect("quick-reconnect")
+    th = Thread.new { ctx.eval("nap()") }
+    sleep 0.2 # inside the Ruby callback: what the first frontend sends now waits
+    first.send_text(JSON.generate(id: 777, method: "Runtime.enable", params: {}))
+    first.close
+    @clients.delete(first)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+    begin
+      second = connect("quick-reconnect")
+    rescue RuntimeError # 409 until the server has seen the close
+      raise if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+      sleep 0.01
+      retry
+    end
+    assert_equal 1, th.value # the queued enable, disconnect and connect run now
+    second.command("Runtime.enable")
+    ctx.eval("console.log('session two')")
+    assert_equal "session two", second.wait_event("Runtime.consoleAPICalled")["args"][0]["value"]
+    # neither the reply to the first frontend's enable nor what it replayed
+    assert_empty second.events.select { |m| m["id"] == 777 }
+    assert_empty(second.events.select { |m| m.to_s.include?("left by session one") })
   end
 
   def test_stop_during_a_blocked_callback_and_a_pause

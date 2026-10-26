@@ -701,15 +701,18 @@ static void add_iso_date(Ser *s, VALUE v)
 }
 
 // BigDecimal#to_s("F"), plain notation ("12345678901234567890.123456789"),
-// unless the digits would reach past 1000 places either side of the point:
-// then the default scientific form ("0.1e1001"), so an exponent of a billion
-// can't become a billion-character string
+// unless that would have more than 1000 digits before or after the point:
+// then the default scientific form ("0.1e1002"), whose length follows the
+// significant digits, so an exponent of a billion can't become a
+// billion-character string. 0.1e-1000 is 1001 places after the point.
 static void add_decimal_string(Ser *s, VALUE v)
 {
     long long e = NUM2LL(rb_funcall(v, rb_intern("exponent"), 0));
+    long long n = NUM2LL(rb_funcall(v, rb_intern("n_significant_digits"), 0));
     VALUE t;
 
-    if (e > 1000 || e < -1000)
+    // e digits before the point (when positive), n - e after it
+    if (e > 1000 || n - e > 1000)
         t = rb_funcall(v, rb_intern("to_s"), 0);
     else
         t = rb_funcall(v, rb_intern("to_s"), 1, rb_str_new_cstr("F"));
@@ -2384,9 +2387,11 @@ static VALUE inspector_port(VALUE self)
 
 static VALUE context_call_common(int argc, VALUE *argv, VALUE self, char op)
 {
+    struct callback_serialize_args sargs;
     VALUE name, args;
-    VALUE a, e;
+    VALUE a, e, r;
     Context *c;
+    int exc;
     Ser s;
 
     TypedData_Get_Struct(self, Context, &context_type, c);
@@ -2396,7 +2401,17 @@ static VALUE context_call_common(int argc, VALUE *argv, VALUE self, char op)
     // request is (C)all or (D) call_await, [name, args...] array
     ser_init1(&s, op);
     s.b.max = value_limit(c);
-    if (serialize(&s, args, c->ser_opts)) {
+    // a conversion can raise (Date#iso8601, BigDecimal#to_s, a to_time that
+    // was redefined): free what's serialized so far before re-raising
+    sargs.ser = &s;
+    sargs.value = args;
+    sargs.opts = c->ser_opts;
+    r = rb_protect(callback_serialize, (VALUE)&sargs, &exc);
+    if (exc) {
+        ser_reset(&s);
+        rb_jump_tag(exc);
+    }
+    if (FIX2INT(r)) {
         ser_reset(&s);
         rb_raise(runtime_error, "Context.call: %s", s.err);
     }
