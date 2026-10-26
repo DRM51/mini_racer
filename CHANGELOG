@@ -1,3 +1,8 @@
+- 14.6.202.34.5 - 26-10-2026
+  - The `max_memory:` guard against resizable buffers reads `maxByteLength` once and passes V8 only the length, so an options object can no longer answer differently the second time
+  - `Inspector.stop` keeps checking the token until the server thread has exited; count and size settings must be whole numbers
+  - The same changes ship for V8 13.6 as mini_racer 0.22.2.11
+
 - 14.6.202.34.4 - 26-10-2026
   - A reply that can't be returned to Ruby (too large, out of memory) becomes an internal error instead of ending the process; `Platform.set_flags!` raises `NoMemoryError` instead of dropping a flag; an oversized callback error message is replaced instead of sent empty
   - `max_memory:` now also refuses resizable ArrayBuffers and growable SharedArrayBuffers (their memory can't be counted) with a `RangeError`, and ends a script whose heap grows past the limit together with the buffers it holds
