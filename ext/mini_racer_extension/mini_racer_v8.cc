@@ -1876,45 +1876,57 @@ size_t source_offset(const std::u16string& src, int line, int column)
     return std::min(src.size(), at + static_cast<size_t>(std::max(column, 0)));
 }
 
-bool word_at(const std::u16string& src, size_t at, const std::u16string& word)
+// Every let/const/class declaration in a script, by the name it declares:
+// where each starts, in order. Built in one pass, so a capture costs one
+// scan of the source however many variables it shows (a per-name search of
+// a 4 MB pasted library with 400 top-level lets took 21 s). A
+// destructuring pattern declares the names in it that aren't property keys
+// ({ key: name }).
+struct Declarations
 {
-    return src.compare(at, word.size(), word) == 0 && (at == 0 || !ident16(src[at - 1])) &&
-           (at + word.size() >= src.size() || !ident16(src[at + word.size()]));
-}
+    std::u16string source;
+    std::map<std::u16string, std::vector<size_t>> at;
+};
 
-// Where the last let/const/class declaring |name| in src[from, to) starts,
-// or npos. A destructuring pattern declares the names in it that aren't
-// property keys ({ key: name }).
-size_t declaration_of(const std::u16string& src, size_t from, size_t to, const std::u16string& name)
+void index_declarations(Declarations& d)
 {
     static const std::u16string keywords[] = { u"let", u"const", u"class" };
-    size_t found = std::u16string::npos;
-    to = std::min(to, src.size());
-    for (size_t p = from; p < to; p++) {
+    const std::u16string& src = d.source;
+    auto identifier_at = [&](size_t p) {
+        size_t q = p;
+        while (q < src.size() && ident16(src[q])) q++;
+        return q;
+    };
+    for (size_t p = 0; p < src.size(); p++) {
+        if (!ident16(src[p]) || (p > 0 && ident16(src[p - 1]))) continue;
+        size_t word_end = identifier_at(p);
         for (auto& kw : keywords) {
-            if (!word_at(src, p, kw)) continue;
-            size_t q = p + kw.size();
-            while (q < to && space16(src[q])) q++;
-            if (q < to && (src[q] == u'[' || src[q] == u'{')) {
+            if (word_end - p != kw.size() || src.compare(p, kw.size(), kw) != 0) continue;
+            size_t q = word_end;
+            while (q < src.size() && space16(src[q])) q++;
+            if (q < src.size() && (src[q] == u'[' || src[q] == u'{')) {
                 int depth = 0;
-                for (size_t r = q; r < to; r++) {
+                for (size_t r = q; r < src.size(); r++) {
                     char16_t c = src[r];
                     if (c == u'[' || c == u'{') {
                         depth++;
                     } else if (c == u']' || c == u'}') {
                         if (--depth == 0) break;
-                    } else if (word_at(src, r, name)) {
-                        size_t after = r + name.size();
-                        while (after < to && space16(src[after])) after++;
-                        if (after >= to || src[after] != u':') { found = p; break; }
+                    } else if (ident16(c) && !ident16(src[r - 1])) {
+                        size_t name_end = identifier_at(r);
+                        size_t after = name_end;
+                        while (after < src.size() && space16(src[after])) after++;
+                        if (after >= src.size() || src[after] != u':')
+                            d.at[src.substr(r, name_end - r)].push_back(p);
+                        r = name_end - 1;
                     }
                 }
-            } else if (q < to && word_at(src, q, name)) {
-                found = p;
+            } else if (q < src.size() && ident16(src[q]) && !(src[q] >= u'0' && src[q] <= u'9')) {
+                d.at[src.substr(q, identifier_at(q) - q)].push_back(p);
             }
         }
+        p = word_end - 1;
     }
-    return found;
 }
 
 // Where the statement starting at |at| ends: a ';' or a closing bracket
@@ -1931,17 +1943,19 @@ bool statement_continues(const std::u16string& src, size_t nl)
     return after < src.size() && starts.find(src[after]) != std::u16string::npos;
 }
 
-size_t statement_end(const std::u16string& src, size_t at)
+// Scans no further than |until|: whether it ends before then is all that's
+// asked, and a declaration far above the pause mustn't cost the distance.
+size_t statement_end(const std::u16string& src, size_t at, size_t until)
 {
     int depth = 0;
-    for (size_t p = at; p < src.size(); p++) {
+    for (size_t p = at; p < std::min(until, src.size()); p++) {
         char16_t c = src[p];
         if (c == u'(' || c == u'[' || c == u'{') depth++;
         else if (c == u')' || c == u']' || c == u'}') { if (--depth < 0) return p; }
         else if (depth == 0 && c == u';') return p;
         else if (depth == 0 && c == u'\n' && !statement_continues(src, p)) return p;
     }
-    return src.size();
+    return std::min(until, src.size());
 }
 
 // Debugger.getScriptSource as UTF-16, the unit CDP's columns count in
@@ -1967,20 +1981,25 @@ bool capture_script_source(Capture& cap, CaptureWalk& walk, const std::string& s
 // Replaces, in a scope's copied variables, the let/const/class bindings not
 // yet declared at the frame's position with kNotYetDeclared (see above).
 void mark_not_yet_declared(Capture& cap, CaptureWalk& walk, v8::Local<v8::Value> scope, const std::string& type,
-                           v8::Local<v8::Value> location, std::map<std::string, std::u16string>& sources,
+                           v8::Local<v8::Value> location, std::map<std::string, Declarations>& sources,
                            v8::Local<v8::Value> variables)
 {
     if (!variables->IsObject() || (type != "block" && type != "local" && type != "script" && type != "module"))
         return;
+    if (walk.out_of_time()) return;
     auto sc = cap.st.safe_context;
     std::string id = walk.utf8(get_field(sc, location, "scriptId"));
     auto it = sources.find(id);
     if (it == sources.end()) {
-        std::u16string text;
-        if (!capture_script_source(cap, walk, id, &text)) text.clear();
-        it = sources.emplace(id, std::move(text)).first;
+        Declarations d;
+        if (capture_script_source(cap, walk, id, &d.source))
+            index_declarations(d);
+        else
+            d.source.clear();
+        it = sources.emplace(id, std::move(d)).first;
     }
-    const std::u16string& src = it->second;
+    const std::u16string& src = it->second.source;
+    const auto& declared = it->second.at;
     if (src.empty()) return;
     constexpr size_t npos = std::u16string::npos;
     // a location in this frame's script, as an offset; |missing| when absent
@@ -2006,9 +2025,15 @@ void mark_not_yet_declared(Capture& cap, CaptureWalk& walk, v8::Local<v8::Value>
         auto key_string = key.As<v8::String>();
         std::u16string name(key_string->Length(), u'\0');
         key_string->WriteV2(cap.st.isolate, 0, key_string->Length(), reinterpret_cast<uint16_t *>(name.data()));
-        size_t before = declaration_of(src, start, pause, name);
-        bool pending = before != npos ? statement_end(src, before) >= pause
-                                      : declaration_of(src, pause, end, name) != npos;
+        auto found = declared.find(name);
+        if (found == declared.end()) continue;
+        const auto& at = found->second; // ascending
+        // the last declaration in [start, pause), and whether one is in [pause, end)
+        auto first_after = std::lower_bound(at.begin(), at.end(), pause);
+        size_t before = npos;
+        if (first_after != at.begin() && *std::prev(first_after) >= start) before = *std::prev(first_after);
+        bool pending = before != npos ? statement_end(src, before, pause) >= pause
+                                      : first_after != at.end() && *first_after < end;
         if (pending) object->Set(sc, key, walk.str(kNotYetDeclared)).Check();
     }
 }
@@ -2181,7 +2206,7 @@ void capture_record(Capture& cap, const std::string& message)
     if (!frames_v->IsArray()) return;
     auto frames = frames_v.As<v8::Array>();
     auto out_frames = walk.new_array();
-    std::map<std::string, std::u16string> sources; // by scriptId, for mark_not_yet_declared
+    std::map<std::string, Declarations> sources; // by scriptId, for mark_not_yet_declared
     bool script_scope_done = false; // top-level let/const: the same in every frame
     for (uint32_t i = 0, n = frames->Length(); i < n && i < kCaptureFrames && !walk.out_of_time(); i++) {
         v8::Local<v8::Value> frame;
