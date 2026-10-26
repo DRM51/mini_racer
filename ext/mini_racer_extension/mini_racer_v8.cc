@@ -947,6 +947,16 @@ bool inspector_drain(Inspector& in)
             v8_inspector_event(in.st.ruby_context, INSPECTOR_EVENT_DETACHED, nullptr);
             if (!in.session)
                 break;
+            // V8 keeps the last 1000 console.* calls' arguments and replays
+            // them to the next frontend: one session's must not reach the
+            // next. The reply goes nowhere, the frontend being gone.
+            {
+                static const char discard[] = "{\"id\":-1,\"method\":\"Runtime.discardConsoleEntries\"}";
+                std::vector<uint16_t> u16 = utf8_to_utf16(discard);
+                in.dispatch_depth++;
+                in.session->dispatchProtocolMessage(v8_inspector::StringView(u16.data(), u16.size()));
+                in.dispatch_depth--;
+            }
             // inspector_detach: :terminate ends what the debugger was
             // watching instead of letting it run on unobserved
             if (v8_inspector_detach_terminates(in.st.ruby_context) &&

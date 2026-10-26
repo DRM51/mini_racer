@@ -1,6 +1,7 @@
 #include "mini_racer_inspector.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -54,12 +55,21 @@ std::atomic<size_t> g_max_targets{0}; // 0: no cap
 struct Conn
 {
     int fd;
-    std::mutex wmu;       // serializes writes; guards |closed|
+    std::mutex wmu;       // serializes writes; guards |closed| and the queue
     bool closed = false;
+    // WebSocket frames waiting to be written, oldest first; the server
+    // thread writes them as the socket allows (see enqueue_frame)
+    std::deque<std::string> out;
+    size_t out_off = 0;   // bytes of out.front() already written
+    size_t out_bytes = 0; // queued and not yet written
+    std::chrono::steady_clock::time_point out_progress{}, out_started{};
     // server thread only
     std::string in;
     bool ws = false;
     std::string frag;
+    bool fragmented = false; // a message's first frame came without FIN
+    // when a partial frame or message was first seen; zero when there's none
+    std::chrono::steady_clock::time_point partial_since{};
     std::weak_ptr<Target> target;
     std::chrono::steady_clock::time_point accepted = std::chrono::steady_clock::now();
 
@@ -94,6 +104,8 @@ int g_lfd = -1;
 // stop_server writes to g_wake_w; the server thread then closes everything
 // and exits, and stop_server joins it
 int g_wake_r = -1, g_wake_w = -1;
+// the wake pipe also says "frames are queued"; this says "stop"
+std::atomic<bool> g_stopping{false};
 pthread_t g_thread;
 bool g_thread_running = false;
 
@@ -102,6 +114,16 @@ bool g_thread_running = false;
 // g_mu across the fork so the child inherits it in a known state, then drop
 // everything that belongs to the parent. Targets are leaked, not destroyed:
 // their mutexes may be held by threads that no longer exist.
+// wakes the server thread to write queued frames; any thread
+void wake_server()
+{
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (g_wake_w >= 0) {
+        char b = 1; // a full pipe is fine: the server is due to wake anyway
+        while (write(g_wake_w, &b, 1) < 0 && errno == EINTR) {}
+    }
+}
+
 void atfork_prepare() { g_mu.lock(); }
 void atfork_parent() { g_mu.unlock(); }
 void atfork_child()
@@ -317,7 +339,7 @@ bool send_raw(Conn& c, const std::string& data)
     return false;
 }
 
-bool send_frame(Conn& c, int opcode, const std::string& payload)
+std::string frame(int opcode, const std::string& payload)
 {
     std::string h;
     h += static_cast<char>(0x80 | opcode);
@@ -333,13 +355,77 @@ bool send_frame(Conn& c, int opcode, const std::string& payload)
         for (int i = 7; i >= 0; i--)
             h += static_cast<char>(n >> (i * 8));
     }
+    return h + payload;
+}
+
+void wake_server();
+
+// Queues a frame for the server thread to write; any thread. Never waits
+// on the socket, so a frontend that stops reading can't stall the V8
+// thread. A frontend whose unread frames pass max_queued_bytes is
+// dropped instead.
+bool enqueue_frame(Conn& c, int opcode, const std::string& payload)
+{
+    std::string f = frame(opcode, payload);
+    {
+        std::lock_guard<std::mutex> lock(c.wmu);
+        if (c.closed)
+            return false;
+        if (c.out_bytes + f.size() > g_max_queued_bytes.load()) {
+            shutdown(c.fd, SHUT_RDWR); // the server thread closes it
+            return false;
+        }
+        if (c.out.empty())
+            c.out_progress = c.out_started = std::chrono::steady_clock::now();
+        c.out_bytes += f.size();
+        c.out.push_back(std::move(f));
+    }
+    wake_server(); // after wmu: close_conn takes g_mu, then wmu
+    return true;
+}
+
+// Server thread: writes what the socket takes now. False on an error, or a
+// frontend that hasn't read for send_idle_ms or let one frame take longer
+// than send_total_ms: the caller closes the connection.
+bool flush_some(Conn& c)
+{
+#ifdef MSG_NOSIGNAL
+    const int flags = MSG_NOSIGNAL;
+#else
+    const int flags = 0; // SO_NOSIGPIPE is set on accept
+#endif
+    using clock = std::chrono::steady_clock;
     std::lock_guard<std::mutex> lock(c.wmu);
     if (c.closed)
         return false;
-    if (write_all(c, h.data(), h.size()) && write_all(c, payload.data(), payload.size()))
+    while (!c.out.empty()) {
+        const std::string& f = c.out.front();
+        ssize_t r = ::send(c.fd, f.data() + c.out_off, f.size() - c.out_off, flags);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) return false;
+            break;
+        }
+        c.out_off += static_cast<size_t>(r);
+        c.out_bytes -= static_cast<size_t>(r);
+        c.out_progress = clock::now();
+        if (c.out_off == f.size()) {
+            c.out.pop_front();
+            c.out_off = 0;
+            c.out_started = c.out_progress;
+        }
+    }
+    if (c.out.empty())
         return true;
-    shutdown(c.fd, SHUT_RDWR);
-    return false;
+    const auto now = clock::now();
+    return now - c.out_progress < std::chrono::milliseconds(g_send_idle_ms.load()) &&
+           now - c.out_started < std::chrono::milliseconds(g_send_total_ms.load());
+}
+
+bool has_output(Conn& c)
+{
+    std::lock_guard<std::mutex> lock(c.wmu);
+    return !c.out.empty();
 }
 
 void close_conn(const std::shared_ptr<Conn>& c)
@@ -437,6 +523,73 @@ std::string target_list(const std::string& hostport)
 
 bool handle_ws(const std::shared_ptr<Conn>& c);
 
+// RFC 7230 token characters, for header names
+bool is_token(const std::string& s)
+{
+    if (s.empty()) return false;
+    for (unsigned char ch : s) {
+        if (ch <= 0x20 || ch >= 0x7F) return false;
+        if (strchr("()<>@,;:\\\"/[]?={}", ch)) return false;
+    }
+    return true;
+}
+
+// a comma-separated header value contains |want|, case-insensitively, as a
+// whole token ("keep-alive, Upgrade" contains "upgrade"; "notupgrade" doesn't)
+bool has_token(const std::string& value, const char *want)
+{
+    size_t i = 0;
+    while (i <= value.size()) {
+        size_t j = value.find(',', i);
+        if (j == std::string::npos) j = value.size();
+        size_t a = i, b = j;
+        while (a < b && (value[a] == ' ' || value[a] == '\t')) a++;
+        while (b > a && (value[b - 1] == ' ' || value[b - 1] == '\t')) b--;
+        if (lower(value.substr(a, b - a)) == want) return true;
+        i = j + 1;
+    }
+    return false;
+}
+
+// RFC 6455 4.1: the key is 16 random bytes, base64: 22 characters and "=="
+bool valid_websocket_key(const std::string& k)
+{
+    if (k.size() != 24 || k[22] != '=' || k[23] != '=') return false;
+    for (size_t i = 0; i < 22; i++) {
+        unsigned char ch = k[i];
+        if (!isalnum(ch) && ch != '+' && ch != '/') return false;
+    }
+    // the last character carries 2 bits; the other 4 must be zero
+    return strchr("AQgw", k[21]) != nullptr;
+}
+
+bool valid_utf8(const std::string& s)
+{
+    size_t i = 0, n = s.size();
+    while (i < n) {
+        unsigned char c = s[i];
+        size_t len;
+        uint32_t cp;
+        if (c < 0x80) { i++; continue; }
+        else if ((c & 0xE0) == 0xC0) { len = 2; cp = c & 0x1F; }
+        else if ((c & 0xF0) == 0xE0) { len = 3; cp = c & 0x0F; }
+        else if ((c & 0xF8) == 0xF0) { len = 4; cp = c & 0x07; }
+        else return false;
+        if (i + len > n) return false;
+        for (size_t k = 1; k < len; k++) {
+            unsigned char cc = s[i + k];
+            if ((cc & 0xC0) != 0x80) return false;
+            cp = cp << 6 | (cc & 0x3F);
+        }
+        // no overlong forms, surrogates or code points past U+10FFFF
+        if ((len == 2 && cp < 0x80) || (len == 3 && cp < 0x800) || (len == 4 && cp < 0x10000) ||
+            (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF)
+            return false;
+        i += len;
+    }
+    return true;
+}
+
 // Returns false when the connection should be closed.
 bool handle_http(const std::shared_ptr<Conn>& c)
 {
@@ -449,19 +602,35 @@ bool handle_http(const std::shared_ptr<Conn>& c)
     size_t eol = head.find("\r\n");
     std::string line = head.substr(0, eol);
     std::map<std::string, std::string> headers;
+    // Strict parsing: a header the server and a proxy in front of it could
+    // read differently (a second Host, a folded line, "Host :") is refused
+    // rather than guessed at.
+    bool malformed = false;
     while (eol != std::string::npos) {
         size_t start = eol + 2;
         eol = head.find("\r\n", start);
         std::string h = head.substr(start, eol == std::string::npos ? std::string::npos : eol - start);
         size_t colon = h.find(':');
-        if (colon == std::string::npos) continue;
+        if (colon == std::string::npos || !is_token(h.substr(0, colon))) {
+            malformed = true; // also catches obsolete line folding
+            break;
+        }
         size_t v = colon + 1;
         while (v < h.size() && (h[v] == ' ' || h[v] == '\t')) v++;
-        headers[lower(h.substr(0, colon))] = h.substr(v);
+        size_t ve = h.size();
+        while (ve > v && (h[ve - 1] == ' ' || h[ve - 1] == '\t')) ve--;
+        std::string name = lower(h.substr(0, colon));
+        if (headers.count(name)) {
+            malformed = true; // duplicates are never needed here
+            break;
+        }
+        headers[name] = h.substr(v, ve - v);
     }
     size_t sp1 = line.find(' ');
     size_t sp2 = sp1 == std::string::npos ? sp1 : line.find(' ', sp1 + 1);
-    if (sp2 == std::string::npos) {
+    std::string version = sp2 == std::string::npos ? std::string() : line.substr(sp2 + 1);
+    if (malformed || sp2 == std::string::npos ||
+        (version != "HTTP/1.1" && version != "HTTP/1.0")) {
         send_raw(*c, http_response("400 Bad Request", "{}"));
         return false;
     }
@@ -498,8 +667,8 @@ bool handle_http(const std::shared_ptr<Conn>& c)
         // a strict handshake, so that only a WebSocket client can get here:
         // a plain HTTP client tricked into sending an Upgrade header (SSRF)
         // can't also produce frames, and pipelined bytes are refused
-        if (method != "GET" || lower(headers["connection"]).find("upgrade") == std::string::npos ||
-            headers["sec-websocket-version"] != "13" || headers["sec-websocket-key"].size() != 24 ||
+        if (method != "GET" || version != "HTTP/1.1" || !has_token(headers["connection"], "upgrade") ||
+            headers["sec-websocket-version"] != "13" || !valid_websocket_key(headers["sec-websocket-key"]) ||
             headers.count("content-length") || headers.count("transfer-encoding") ||
             !c->in.empty()) {
             send_raw(*c, http_response("400 Bad Request", "{\"error\":\"bad WebSocket handshake\"}"));
@@ -570,6 +739,8 @@ bool handle_ws(const std::shared_ptr<Conn>& c)
         uint8_t b1 = static_cast<uint8_t>(in[1]);
         bool fin = b0 & 0x80;
         int op = b0 & 0x0F;
+        if (b0 & 0x70)
+            return false; // RSV bits: no extension was negotiated
         if (!(b1 & 0x80))
             return false; // clients must mask
         uint64_t len = b1 & 0x7F;
@@ -583,6 +754,8 @@ bool handle_ws(const std::shared_ptr<Conn>& c)
             len = 0;
             for (int i = 2; i < 10; i++)
                 len = len << 8 | uint8_t(in[i]);
+            if (len >> 63)
+                return false; // RFC 6455 5.2: the top bit must be 0
             hdr = 10;
         }
         if (op >= 0x8 && (len > 125 || !fin))
@@ -600,21 +773,38 @@ bool handle_ws(const std::shared_ptr<Conn>& c)
 
         switch (op) {
         case 0x8: // close
-            send_frame(*c, 0x8, payload.substr(0, 2));
+            // best effort, and only if nothing is queued ahead of it
+            if (!has_output(*c)) {
+                std::string f = frame(0x8, payload.substr(0, 2));
+                std::lock_guard<std::mutex> lock(c->wmu);
+                if (!c->closed)
+                    (void)::send(c->fd, f.data(), f.size(), 0);
+            }
             return false;
         case 0x9: // ping
-            send_frame(*c, 0xA, payload);
+            if (!enqueue_frame(*c, 0xA, payload))
+                return false;
             break;
         case 0xA: // pong
             break;
         case 0x1: // text
         case 0x2: // binary; DevTools only sends text, accept both
+            if (c->fragmented)
+                return false; // a new message before the last one finished
             c->frag = std::move(payload);
             [[fallthrough]];
         case 0x0: // continuation
-            if (op == 0x0)
+            if (op == 0x0) {
+                if (!c->fragmented)
+                    return false; // continues nothing
                 c->frag += payload;
+            }
+            c->fragmented = !fin;
             if (fin) {
+                // protocol messages are JSON text; refuse what V8 would
+                // have to guess at
+                if (!valid_utf8(c->frag))
+                    return false;
                 if (auto t = c->target.lock())
                     if (!push_message(*t, std::move(c->frag)))
                         return false;
@@ -652,32 +842,53 @@ void *server_main(void *arg)
         pfds.push_back({lfd, POLLIN, 0});
         pfds.push_back({fds.wake, POLLIN, 0});
         for (auto& c : conns)
-            pfds.push_back({c->fd, POLLIN, 0});
+            pfds.push_back({c->fd, static_cast<short>(POLLIN | (has_output(*c) ? POLLOUT : 0)), 0});
         // wake up now and then to expire connections that never finished
-        // their request
+        // their request, or stopped reading
         if (poll(pfds.data(), pfds.size(), conns.empty() ? -1 : 1000) < 0) {
             if (errno == EINTR) continue;
             return nullptr;
         }
-        if (pfds[1].revents) { // stop_server
-            for (auto& c : conns)
-                close_conn(c); // each target sees Event::Disconnect
-            close(lfd);
-            close(fds.wake);
-            return nullptr;
+        if (pfds[1].revents) {
+            char buf[256];
+            while (read(fds.wake, buf, sizeof(buf)) > 0) {}
+            if (g_stopping.load()) { // stop_server
+                for (auto& c : conns)
+                    close_conn(c); // each target sees Event::Disconnect
+                close(lfd);
+                close(fds.wake);
+                return nullptr;
+            }
         }
         const auto now = std::chrono::steady_clock::now();
         const auto handshake = std::chrono::milliseconds(g_handshake_ms.load());
         std::vector<std::shared_ptr<Conn>> keep;
         for (size_t i = 2; i < pfds.size(); i++) {
             auto& c = conns[i - 2];
-            if (pfds[i].revents && !handle_read(c)) {
+            if ((pfds[i].revents & (POLLIN | POLLHUP | POLLERR)) && !handle_read(c)) {
+                close_conn(c);
+                continue;
+            }
+            if (has_output(*c) && !flush_some(*c)) {
                 close_conn(c);
                 continue;
             }
             if (!c->ws && now - c->accepted >= handshake) {
                 close_conn(c);
                 continue;
+            }
+            // once connected, a frame or a fragmented message left half sent
+            // for as long as a handshake may take is dropped, so a client
+            // can't hold a slot (and up to max_message bytes) by stalling
+            if (c->ws && (!c->in.empty() || c->fragmented)) {
+                if (c->partial_since == std::chrono::steady_clock::time_point())
+                    c->partial_since = now;
+                else if (now - c->partial_since >= handshake) {
+                    close_conn(c);
+                    continue;
+                }
+            } else {
+                c->partial_since = std::chrono::steady_clock::time_point();
             }
             keep.push_back(c);
         }
@@ -806,7 +1017,7 @@ void send(Target& t, const std::string& utf8)
         conn = t.conn;
     }
     if (conn)
-        send_frame(*conn, 0x1, utf8);
+        enqueue_frame(*conn, 0x1, utf8);
 }
 
 int start_server(const std::string& host, int port, const std::string& token,
@@ -880,6 +1091,7 @@ int start_server(const std::string& host, int port, const std::string& token,
         return -1;
     }
     g_thread_running = true;
+    g_stopping = false;
     g_wake_r = wake[0];
     g_wake_w = wake[1];
     g_lfd = lfd;
@@ -905,6 +1117,7 @@ bool stop_server()
         // the server thread closes g_lfd and g_wake_r itself
         g_lfd = g_wake_r = g_wake_w = -1;
     }
+    g_stopping = true;
     char b = 0;
     while (write(wake_w, &b, 1) < 0 && errno == EINTR) {}
     pthread_join(thr, nullptr); // it takes g_mu in close_conn: not held here

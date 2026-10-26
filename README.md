@@ -344,6 +344,16 @@ MiniRacer::Inspector.stop      # drop every frontend, stop listening
   counted in `Inspector.events_dropped`, and a gap in `seq` shows where.
   Reading consumes them, so have one reader. They record what happened; they
   are not a way to stop anything (use `Context#stop` or `#disconnect_debugger`).
+- The server parses strictly: duplicate or malformed headers, a
+  `Connection` header without the `upgrade` token, a malformed WebSocket key,
+  reserved frame bits, out-of-order fragments and non-UTF-8 text all end the
+  connection, as does a frame or fragmented message left half-sent for
+  `handshake_timeout`. Protocol messages to a frontend are queued and written
+  by the server thread, so a frontend that stops reading never stalls a
+  script: it's dropped once `max_queued_bytes` are waiting or nothing has
+  been read for `send_idle_timeout`.
+- When a frontend detaches, the console messages V8 keeps for replay are
+  cleared, so the next debugger doesn't see the previous session's.
 - `Inspector.stop` disconnects frontends as if they had gone away
   (`inspector_detach:` applies) and waits for the server thread. Contexts stay
   inspectable and are listed again when the server restarts.
