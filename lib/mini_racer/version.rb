@@ -2,6 +2,6 @@
 
 module MiniRacer
   # DRM51 build: the V8 version, then our build number
-  VERSION = "14.6.202.34.6"
+  VERSION = "14.6.202.34.7"
   LIBV8_NODE_VERSION = "~> 14.6.202.34"
 end

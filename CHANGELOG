@@ -1,3 +1,11 @@
+- 14.6.202.34.7 - 26-10-2026
+  - Add `Context.new(decimal: :string)`, which passes a `BigDecimal` as its exact digits (`"12345678901234567890.5"`) where `:float` keeps about 15 significant digits
+  - `date: :iso` writes a year before 0 or after 9999 in ECMAScript's expanded form (`"+012345-06-07"`), which `new Date()` can parse
+  - Add `MiniRacer::CONVERSIONS`, the `date:` and `decimal:` values this build accepts, so callers can check for an option instead of the version
+  - Inspector: malformed or ambiguous HTTP requests and WebSocket frames close the connection; outgoing messages are queued, so a slow debugger can't block the script; a detach discards the console messages kept for the next debugger
+  - A very small `max_value_size` ends in an error, not an abort or endless retries; `capture_on_throw` expressions stop at the recording deadline and fall back to an outer frame only on a real `ReferenceError`
+  - The same changes ship for V8 13.6 as mini_racer 0.22.2.14
+
 - 14.6.202.34.6 - 26-10-2026
   - Each value passed between Ruby and JavaScript is limited to the context's `max_memory` (1 GiB without one, and never more), or to `Context.new(max_value_size: bytes)`; the error names the limit in force, e.g. "serialized value too large (over 512 MB)"
   - The same change ships for V8 13.6 as mini_racer 0.22.2.12
