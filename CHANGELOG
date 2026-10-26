@@ -1,72 +1,29 @@
-- 0.22.2.15 - 26-10-2026
-  - DRM51 build: 0.22.2.14 plus the changes below
-  - Inspector replies and events go only to the frontend the V8 thread is serving: one that attaches while the last one's commands are still queued no longer receives their replies or the console entries they replayed
-  - An attach error is held to `max_value_size` like other script values (a getter on the attach path could make it any size)
-  - `Context#call` frees its request when a Ruby conversion raises
-  - A frontend that sends message after message is no longer dropped at `handshake_timeout`
-  - `decimal: :string` switches to scientific form at more than 1000 digits before or after the point, counted from the significant digits
-  - `capture_on_throw` expressions move to an outer frame only when the name is really unbound in the inner one
-  - Stricter inspector parsing: control characters in header values, HTTP/1.1 without Host, non-minimal WebSocket lengths and malformed close frames are refused
+- DRM51 builds of 0.22.2 on V8 13.6, 0.22.2.1 to 0.22.2.15 - 25-10-2026 to 26-10-2026
+  The fourth version segment numbers our builds; upstream doesn't use it. Builds are published at https://drm51.github.io/gems, which lists only the ones in use; every build stays on GitHub as a signed tag and release.
 
-- 0.22.2.14 - 26-10-2026
-  - DRM51 build: 0.22.2.13 plus the changes below
-  - Add `Context.new(decimal: :string)`, which passes a `BigDecimal` as its exact digits (`"12345678901234567890.5"`) where `:float` keeps about 15 significant digits
-  - `date: :iso` writes a year before 0 or after 9999 in ECMAScript's expanded form (`"+012345-06-07"`), which `new Date()` can parse
-  - Add `MiniRacer::CONVERSIONS`, the `date:` and `decimal:` values this build accepts, so callers can check for an option instead of the version
-  - Inspector: malformed or ambiguous HTTP requests and WebSocket frames close the connection; outgoing messages are queued, so a slow debugger can't block the script; a detach discards the console messages kept for the next debugger
-  - A very small `max_value_size` ends in an error, not an abort or endless retries; `capture_on_throw` expressions stop at the recording deadline and fall back to an outer frame only on a real `ReferenceError`
+  What the DRM51 build adds to upstream 0.22.2 and its unreleased fixes:
+  - Remote debugging with Chrome DevTools
+    - `MiniRacer::Inspector.start(port:, host:, token:, allow_remote:)` and its transport limits (`max_targets:`, message, queue, handshake and send timeouts); `Inspector.stop`, `.endpoint`, `.events`, `.url`
+    - `Context.new(inspector:, max_pause:, inspector_detach: :resume | :terminate)`; `Context#wait_for_debugger`, `#debugger_attached?`, `#inspector_target_id`, `#inspector_state`, `#await_debugger`, `#cancel_debugger_wait`, `#disconnect_debugger`
+    - Time paused at a breakpoint doesn't count against `timeout:`; `max_pause:` (default 10 minutes) ends a pause, or a debugger expression, that goes on too long. DevTools' "Pause on uncaught exceptions" stops on errors that escape to Ruby
+    - The server binds to loopback unless `allow_remote: true`, checks Host and Origin, parses HTTP and WebSocket strictly, queues outgoing messages so a slow debugger can't block a script, sends each frontend only its own session's replies, and discards the console between sessions
+  - `Context.new(capture_on_throw: true)` or `{expressions: [...]}`: when an exception escapes to Ruby, `MiniRacer::RuntimeError#capture` holds each frame's function, location and local variables, copied without running JavaScript, and up to 20 expressions evaluated side-effect-free in the failing frame. Opt-in; see the README section "Locals of an uncaught exception" for its costs and limits
+  - Limits
+    - `max_memory:` also counts ArrayBuffer and typed array memory (an allocation past it throws a catchable `RangeError`) and refuses resizable and growable buffers, whose memory can't be counted
+    - Each value passed between Ruby and JavaScript is limited to `max_memory` (1 GiB without one, and never more), or to `Context.new(max_value_size:)`; the error names the limit in force
+  - Conversions
+    - `Context.new(date: :iso)` passes a date-only `Date` as an ISO 8601 string (`"2026-10-25"`, or `"+012345-06-07"` for far years) instead of a `Date` at local midnight
+    - `Context.new(decimal: :float | :string)` passes a `BigDecimal` as a number, or as its exact digits, instead of `"Undefined Conversion"`
+    - `MiniRacer::CONVERSIONS` lists the values this build accepts
+  - Robustness: a reply that can't be returned to Ruby becomes an error instead of ending the process; `Thread#kill` during conversion kills the thread (#404); a `throw` from a Ruby callback past the JavaScript call raises instead of crashing
+  - JavaScript objects return to Ruby about twice as fast, and Hashes and Arrays passed to JavaScript no longer get a permanent `object_id`
+  - From upstream issues: multiline error messages kept apart from backtraces (#262), Ruby `Date` values converted to JavaScript `Date` (#136), `Context#load` returns nil without invoking getters (#197)
 
-- 0.22.2.13 - 26-10-2026
-  - DRM51 build: 0.22.2.12 plus the change below
-  - `capture_on_throw: {expressions: [...]}`, from drm51_mini_racer 14.6.202.34.2: up to 20 JavaScript expressions evaluated in the failing frame (or the next one out where their names are defined), in V8's side-effect-free mode with a 50 ms limit each; results in `capture["expressions"]`
-
-- 0.22.2.12 - 26-10-2026
-  - DRM51 build: 0.22.2.11 plus the change below
-  - Each value passed between Ruby and JavaScript is limited to the context's `max_memory` (1 GiB without one, and never more), or to `Context.new(max_value_size: bytes)`; the error names the limit in force, e.g. "serialized value too large (over 512 MB)"
-
-- 0.22.2.11 - 26-10-2026
-  - DRM51 build: 0.22.2.10 plus the changes below
-  - The `max_memory:` guard against resizable buffers reads `maxByteLength` once and passes V8 only the length, so an options object can no longer answer differently the second time
-  - `Inspector.stop` keeps checking the token until the server thread has exited; count and size settings must be whole numbers
-
-- 0.22.2.10 - 26-10-2026
-  - DRM51 build: 0.22.2.9 plus the changes below
-  - A reply that can't be returned to Ruby (too large, out of memory) becomes an internal error instead of ending the process; `Platform.set_flags!` raises `NoMemoryError` instead of dropping a flag; an oversized callback error message is replaced instead of sent empty
-  - `max_memory:` now also refuses resizable ArrayBuffers and growable SharedArrayBuffers (their memory can't be counted) with a `RangeError`, and ends a script whose heap grows past the limit together with the buffers it holds
-  - `Thread#kill` while a result is converted to Ruby kills the thread instead of raising `TypeError` (upstream #404); a `throw` from a Ruby callback to a `catch` outside the JavaScript call raises a `RuntimeError` instead of crashing
-  - capture_on_throw: an object's keys are listed once, integer keys past the first 50 get the "… N more" marker, non-enumerable integer keys stay hidden; deep throws are parsed faster
-  - Inspector: DevTools' "Pause on uncaught exceptions" stops on errors that escape to Ruby
-  - Inspector, for supervising debugging sessions: `Context#inspector_target_id`, `#inspector_state`, `#await_debugger` (`:ready`, `:timeout`, `:cancelled`, `:disposed`), `#cancel_debugger_wait`, `#disconnect_debugger`, `Context.new(inspector_detach: :resume | :terminate)`; `Inspector.start` takes the transport limits and `max_targets:` and refuses different settings once started; `Inspector.stop`, `Inspector.endpoint`, `Inspector.events`
-
-- 0.22.2.9 - 26-10-2026
-  - DRM51 build: 0.22.2.7 plus the changes below
-  - Values passed between Ruby and JavaScript are limited to 1 GiB serialized; larger ones raise `MiniRacer::RuntimeError` ("serialized value too large (over 1 GiB)", or "RangeError: value too large to return to Ruby" from JavaScript)
-  - `max_memory:` now also counts ArrayBuffer and typed array memory; an allocation past the limit throws a catchable `RangeError` ("Array buffer allocation failed"). The README lists what it still doesn't cover (WebAssembly memories, copies between Ruby and JavaScript)
-  - `decimal: :float` converts only BigDecimal itself, not subclasses
-  - capture_on_throw: the 100 ms deadline starts at the pause, at most 20 scopes are recorded per frame, integer keys past 50 aren't enumerated, and only the innermost 10 frames of V8's pause message are parsed (a throw thousands of frames deep now gets a capture)
-
-- 0.22.2.7 - 25-10-2026
-  - DRM51 build: 0.22.2.5 plus the change below
-  - capture_on_throw: a record attaches only to the error of the eval or call it was made in, and not at all when two records of that evaluation match the thrown value; long Symbol descriptions, function names and error messages are shortened before they are converted; long property names that shorten alike no longer overwrite each other
-
-- 0.22.2.5 - 25-10-2026
-  - DRM51 build: 0.22.2.3 plus the change below
-  - Add `Context.new(capture_on_throw: true)`: when an exception escapes to Ruby, `MiniRacer::RuntimeError#capture` holds each frame's function, script, line and column and its local variables, copied without running JavaScript by an in-process V8 inspector session. Opt-in. While enabled it slows compiling, `await` and throwing; see the README section "Locals of an uncaught exception" for its costs and limits
-
-- 0.22.2.3 - 25-10-2026
-  - DRM51 build: 0.22.2.1 plus the change below
-  - Add `Context.new(date: :iso)`, which passes a date-only `Date` to JavaScript as an ISO 8601 string (`"2026-10-25"`) instead of a `Date` at local midnight, and `Context.new(decimal: :float)`, which passes a `BigDecimal` as a number instead of `"Undefined Conversion"`. Both apply to attached function results and `Context#call` arguments; the defaults are unchanged
-
-- 0.22.2.1 - 25-10-2026
-  - DRM51 build: upstream 0.22.2 and its unreleased fixes, plus the changes below. The fourth version segment numbers our builds; upstream does not use it
-  - Add remote debugging with Chrome DevTools: `MiniRacer::Inspector.start(port:, host:, token:, allow_remote:)`, `Context.new(inspector:, max_pause:)`, `Context#wait_for_debugger`, `Context#debugger_attached?`, `Inspector.url`
-  - Time spent paused at a breakpoint does not count against `timeout:`; `max_pause:` (default 10 minutes) ends a pause, or a debugger expression run during one, that goes on too long
-  - The inspector server binds to loopback unless `allow_remote: true`, checks Host and Origin headers, requires a strict WebSocket handshake, and bounds connections, message sizes, queued messages and idle handshakes
-  - Return JavaScript objects to Ruby about twice as fast: strings are converted in C instead of through `String#encode!`, and repeated object keys share one frozen string
-  - Stop assigning a permanent `object_id` to every Hash and Array passed to JavaScript
-  - Preserve multiline JavaScript runtime error messages separately from backtraces (#262)
-  - Convert Ruby Date values, including nested values and callback results, to JavaScript Date using to_time (#136)
-  - Discard Context#load's completion value to avoid invoking getters during result conversion; load now returns nil (#197)
+  Builds:
+  - 0.22.2.15: Codex's review of 0.22.2.14 (debugger session isolation, attach errors held to the value limit, stricter parsing)
+  - 0.22.2.14: `decimal: :string`, far years, `MiniRacer::CONVERSIONS`; inspector transport hardening
+  - 0.22.2.13: capture expressions. The version integration_tool pins
+  - 0.22.2.1 to 0.22.2.12 (odd numbers): earlier steps toward the above; 0.22.2.2 to 0.22.2.8 (even numbers) were the same code on V8 14.6, now drm51_mini_racer
 
 - 0.22.2 - 23-10-2026
   - Fix nested Symbols, functions, and Map keys aborting the process during `eval`/`call` serialization (#447)
