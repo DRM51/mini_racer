@@ -249,6 +249,27 @@ class MiniRacerInspectorTest < Minitest::Test
     assert_equal 3, th.value
   end
 
+  def test_pause_on_uncaught_exceptions_stops_on_errors_escaping_to_ruby
+    ctx = new_context(inspector: "uncaught")
+    client = attach_like_devtools("uncaught")
+    client.command("Debugger.setPauseOnExceptions", state: "uncaught")
+    # caught in JavaScript: no pause
+    assert_equal "caught",
+                 ctx.eval("try { throw new Error('x') } catch (e) { 'caught' }")
+    th = Thread.new { ctx.eval("(function f() { const row = 7; throw new Error('bad') })()") }
+    paused = client.wait_event("Debugger.paused")
+    assert_equal "exception", paused["reason"]
+    frame = paused["callFrames"].first
+    r = client.command("Debugger.evaluateOnCallFrame", callFrameId: frame["callFrameId"], expression: "row")
+    assert_equal 7, r["result"]["value"]
+    client.command("Debugger.resume")
+    error = assert_raises(MiniRacer::RuntimeError) { th.value }
+    assert_includes error.message, "bad"
+    # turned off again: the error goes straight to Ruby
+    client.command("Debugger.setPauseOnExceptions", state: "none")
+    assert_raises(MiniRacer::RuntimeError) { ctx.eval("throw new Error('quiet')") }
+  end
+
   def test_ruby_callback_from_breakpoint_console
     ctx = new_context(inspector: "paused-callback")
     ctx.attach("rubyAdd", proc { |a, b| a + b })
