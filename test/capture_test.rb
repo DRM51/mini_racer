@@ -638,10 +638,12 @@ class MiniRacerCaptureTest < Minitest::Test
     big = variables(capture["frames"][0], "script")["big"]
     assert_equal (0...50).map(&:to_s) + ["\u2026"], big.keys
     assert_equal "999951 more", big["\u2026"]
-    # integer keys anywhere, in order and before names; non-enumerable ones stay hidden
+    # integer keys anywhere, in order and before names; non-enumerable ones
+    # stay hidden (a fresh context: walking `big` again could use up the
+    # recording deadline on a loaded machine)
     sparse =
       capture_of do
-        ctx.eval(<<~JS)
+        new_context.eval(<<~JS)
           const o = { name: "c", 1000: "far", 0: "a" }
           Object.defineProperty(o, 5, { value: "hidden", enumerable: false })
           throw o
