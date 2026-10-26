@@ -161,6 +161,10 @@ struct State
     std::atomic<int64_t> heap_used_at_gc;
     // the last full GC found heap plus ArrayBuffers over max_memory
     bool over_budget_at_last_full_gc;
+    // set while mini_racer sends a reply of its own (heap stats, a pump's
+    // result, the short error that replaces an unsendable one): those aren't
+    // the script's values and don't count against the value limit
+    bool reply_internal;
     int err_reason;
     // TerminateExecution() while idle doesn't make IsExecutionTerminating() true
     std::atomic<unsigned> terminate_requested;
@@ -242,7 +246,8 @@ struct Serialized
 
     Serialized(State& st, v8::Local<v8::Value> v)
     {
-        SerializerDelegate delegate(st.isolate, v8_value_limit(st.ruby_context));
+        SerializerDelegate delegate(st.isolate, st.reply_internal ? (size_t{1} << 30)
+                                                                  : v8_value_limit(st.ruby_context));
         v8::ValueSerializer ser(st.isolate, &delegate);
         ser.WriteHeader();
         if (!ser.WriteValue(st.context, v).FromMaybe(false)) return; // exception pending
@@ -261,7 +266,8 @@ struct Serialized
 // 1 GiB limit, or out of memory), throws a RangeError and returns false.
 bool send_reply(State& st, const uint8_t *p, size_t n)
 {
-    int r = v8_reply(st.ruby_context, p, n);
+    int r = st.reply_internal ? v8_reply_snapshot(st.ruby_context, p, n)
+                              : v8_reply(st.ruby_context, p, n);
     if (!r) return true;
     std::string text = r == -1
         ? std::string("value too large to return to Ruby (over ") +
@@ -469,8 +475,37 @@ bool reply(State& st, v8::Local<v8::Value> result, v8::Local<v8::Value> err)
 // for when a reply is not expected to fail because of serialization
 // errors but can still fail when preempted by isolate termination;
 // temporarily cancels the termination exception so it can send the reply
+struct InternalReply
+{
+    State& st;
+    bool saved;
+    explicit InternalReply(State& st) : st(st), saved(st.reply_internal) { st.reply_internal = true; }
+    ~InternalReply() { st.reply_internal = saved; }
+};
+
+// An eval or call's reply; on failure the caller builds an error reply
+// from the exception (goto fail) and comes back. If that error can't be
+// sent either (a max_value_size smaller than the error, say), a short
+// internal error goes instead, so the retry loop always ends. Termination
+// is left to the caller's loop, as before.
+bool reply_or_fallback(State& st, v8::Local<v8::Value> result, v8::Local<v8::Value> err,
+                       bool *retried)
+{
+    if (reply(st, result, err)) return true;
+    if (!*retried || st.isolate->IsExecutionTerminating()) {
+        *retried = true;
+        return false;
+    }
+    std::vector<char> buf;
+    set_error_message(buf, INTERNAL_ERROR, "the error was too large to return to Ruby");
+    InternalReply internal(st);
+    v8::TryCatch try_catch(st.isolate);
+    return reply(st, v8::Undefined(st.isolate), string_from_bytes(st.isolate, buf));
+}
+
 void reply_retry(State& st, v8::Local<v8::Value> response)
 {
+    InternalReply internal(st);
     v8::TryCatch try_catch(st.isolate);
     try_catch.SetVerbose(st.verbose_exceptions);
     bool ok = reply(st, response);
@@ -1765,7 +1800,16 @@ bool capture_evaluate(Capture& cap, CaptureWalk& walk, v8::Local<v8::Value> fram
     walk.put(params, walk.str("objectGroup"), walk.str("capture"));
     walk.put(params, walk.str("silent"), v8::True(st.isolate));
     walk.put(params, walk.str("throwOnSideEffect"), v8::True(st.isolate));
-    walk.put(params, walk.str("timeout"), v8::Number::New(st.isolate, kCaptureEvalMillis));
+    // at most kCaptureEvalMillis, and never past the recording deadline, so
+    // a slow expression can't carry the capture beyond it
+    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+        walk.deadline - std::chrono::steady_clock::now()).count();
+    if (left <= 0) {
+        *error = "[not evaluated: out of time]";
+        return false;
+    }
+    walk.put(params, walk.str("timeout"),
+             v8::Number::New(st.isolate, static_cast<double>(std::min<int64_t>(left, kCaptureEvalMillis))));
     auto request = walk.new_object();
     walk.put(request, walk.str("id"), v8::Integer::New(st.isolate, ++cap.pending_id));
     walk.put(request, walk.str("method"), walk.str("Debugger.evaluateOnCallFrame"));
@@ -1797,7 +1841,11 @@ bool capture_evaluate(Capture& cap, CaptureWalk& walk, v8::Local<v8::Value> fram
         if (!text->IsString()) text = get_field(sc, details, "text");
         std::string line = walk.utf8(text);
         line = line.substr(0, line.find('\n')); // the message, not the stack
-        *missing = names_undefined_identifier(line, expression);
+        // only a real ReferenceError moves on to an outer frame, not a thrown
+        // look-alike whose text happens to match
+        auto class_name = get_field(sc, exception, "className");
+        *missing = class_name->IsString() && walk.utf8(class_name) == "ReferenceError" &&
+                   names_undefined_identifier(line, expression);
         *error = walk.utf8(walk.truncated(walk.str(line)));
         return false;
     }
@@ -2305,6 +2353,7 @@ void restore_termination(State& st, bool suspended)
 // response is errback [result, err] array
 void v8_call_impl(State *pst, const uint8_t *p, size_t n, bool await)
 {
+    bool reply_retried = false; // see reply_or_fallback
     State& st = *pst;
     v8::TryCatch try_catch(st.isolate);
     try_catch.SetVerbose(verbose_try_catch(st));
@@ -2403,7 +2452,7 @@ fail:
                           cause == MEMORY_ERROR ? "out of memory" : "terminated");
         err = string_from_bytes(st.isolate, buf);
     }
-    if (!reply(st, result, err)) {
+    if (!reply_or_fallback(st, result, err, &reply_retried)) {
         assert(try_catch.HasCaught());
         goto fail; // retry; can be termination exception
     }
@@ -2433,6 +2482,7 @@ extern "C" void v8_call_await(State *pst, const uint8_t *p, size_t n)
 // response is errback [result, err] array
 void v8_eval_impl(State *pst, const uint8_t *p, size_t n, bool await)
 {
+    bool reply_retried = false; // see reply_or_fallback
     State& st = *pst;
     v8::TryCatch try_catch(st.isolate);
     try_catch.SetVerbose(verbose_try_catch(st));
@@ -2502,7 +2552,7 @@ fail:
                           cause == MEMORY_ERROR ? "out of memory" : "terminated");
         err = string_from_bytes(st.isolate, buf);
     }
-    if (!reply(st, result, err)) {
+    if (!reply_or_fallback(st, result, err, &reply_retried)) {
         assert(try_catch.HasCaught());
         goto fail; // retry; can be termination exception
     }
@@ -2969,6 +3019,7 @@ int snapshot(bool is_warmup, bool verbose_exceptions,
 // to work around a buggy check in the snapshot deserializer
 extern "C" void v8_snapshot(State *pst, const uint8_t *p, size_t n)
 {
+    bool reply_retried = false; // see reply_or_fallback
     State& st = *pst;
     v8::TryCatch try_catch(st.isolate);
     try_catch.SetVerbose(st.verbose_exceptions);
@@ -3013,7 +3064,7 @@ fail:
     } else {
         err = to_error(st, &try_catch, cause);
     }
-    if (!reply(st, result, err)) {
+    if (!reply_or_fallback(st, result, err, &reply_retried)) {
         assert(try_catch.HasCaught());
         goto fail; // retry; can be termination exception
     }
@@ -3021,6 +3072,7 @@ fail:
 
 extern "C" void v8_warmup(State *pst, const uint8_t *p, size_t n)
 {
+    bool reply_retried = false; // see reply_or_fallback
     State& st = *pst;
     v8::TryCatch try_catch(st.isolate);
     try_catch.SetVerbose(st.verbose_exceptions);
@@ -3083,7 +3135,7 @@ fail:
     } else {
         err = to_error(st, &try_catch, cause);
     }
-    if (!reply(st, result, err)) {
+    if (!reply_or_fallback(st, result, err, &reply_retried)) {
         assert(try_catch.HasCaught());
         goto fail; // retry; can be termination exception
     }

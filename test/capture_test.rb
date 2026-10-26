@@ -664,6 +664,31 @@ class MiniRacerCaptureTest < Minitest::Test
     assert_equal 20, capture["frames"][0]["scopes"].size
   end
 
+  # Codex's review of the expressions (0.22.2.13): wrapping a result or an
+  # exception must not run the script's getters, outside the side-effect check
+  def test_expressions_run_no_getters_when_their_results_are_wrapped
+    ctx = new_context(capture_on_throw: { expressions: ["errLike", "(() => { throw errLike })()", "errLike.message"] })
+    ctx.eval(<<~JS)
+      globalThis.hits = []
+      var errLike = { __proto__: Error.prototype,
+        get message() { hits.push("message"); return "m" },
+        get name() { hits.push("name"); return "N" },
+        get stack() { hits.push("stack"); return "s" } }
+    JS
+    capture = capture_of { ctx.eval("function f() { throw new Error('plain') } f()") }
+    results = capture["expressions"].to_h { |x| [x["expression"], x] }
+    assert_equal "[Getter]", results["errLike"]["value"]["message"]
+    assert_includes results["errLike.message"]["error"], "side-effect"
+    assert_equal [], ctx.eval("hits")
+  end
+
+  def test_a_thrown_look_alike_reference_error_does_not_move_to_an_outer_frame
+    ctx = new_context(capture_on_throw: { expressions: ["fake()"] })
+    ctx.eval("var fake = () => { throw { message: 'fake is not defined' } }")
+    capture = capture_of { ctx.eval("function inner() { throw new Error('x') } function outer() { inner() } outer()") }
+    assert_equal 0, capture["expressions"].first["frame"]
+  end
+
   def test_uncaught_exceptions_are_not_printed
     script = <<~RUBY
       require "mini_racer"
